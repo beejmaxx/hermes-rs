@@ -15,7 +15,7 @@ pub enum IdError {
         /// The logical identifier type.
         kind: &'static str,
     },
-    /// An owner generation or fence token was zero.
+    /// An authority counter was zero.
     #[error("{kind} must be greater than zero")]
     ZeroAuthorityCounter {
         /// The logical counter type.
@@ -80,14 +80,8 @@ macro_rules! opaque_id {
     };
 }
 
-opaque_id!(ProfileId, "A profile-scoped authority identifier.", "profile id");
 opaque_id!(SessionId, "A runtime session identifier.", "session id");
 opaque_id!(LineageId, "An immutable conversation lineage identifier.", "lineage id");
-opaque_id!(RunId, "A single agent or task execution identifier.", "run id");
-opaque_id!(TaskId, "A durable coordination task identifier.", "task id");
-opaque_id!(WorkerId, "A supervised worker identity.", "worker id");
-opaque_id!(BoardId, "A shared board authority identifier.", "board id");
-opaque_id!(EventId, "An idempotent inbox or outbox event identifier.", "event id");
 opaque_id!(ToolCallId, "A model-issued tool invocation identifier.", "tool call id");
 
 macro_rules! authority_counter {
@@ -133,11 +127,9 @@ authority_counter!(
     "A monotonically increasing write-authority generation.",
     "owner generation"
 );
-authority_counter!(FenceToken, "A run-scoped token fencing stale task workers.", "fence token");
-
 #[cfg(test)]
 mod tests {
-    use super::{FenceToken, SessionId};
+    use super::{OwnerGeneration, SessionId};
 
     #[test]
     fn opaque_ids_reject_empty_and_padded_values() {
@@ -149,13 +141,13 @@ mod tests {
 
     #[test]
     fn authority_counters_are_nonzero() {
-        assert!(FenceToken::new(0).is_err());
-        assert_eq!(FenceToken::new(7).map(FenceToken::get), Ok(7));
+        assert!(OwnerGeneration::new(0).is_err());
+        assert_eq!(OwnerGeneration::new(7).map(OwnerGeneration::get), Ok(7));
     }
 
     #[test]
     fn deserialization_cannot_bypass_validation() {
         assert!(serde_json::from_str::<SessionId>(r#"""#).is_err());
-        assert!(serde_json::from_str::<FenceToken>("0").is_err());
+        assert!(serde_json::from_str::<OwnerGeneration>("0").is_err());
     }
 }
