@@ -101,6 +101,9 @@ pub enum RuntimeError {
     /// A typed protocol record could not be projected to or from JSON.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// The live host could not accept an ordered public event.
+    #[error(transparent)]
+    EventObserver(#[from] RuntimeEventObserverError),
 }
 
 #[derive(Default)]
@@ -117,6 +120,59 @@ enum AttemptTerminal {
     Malformed { reason: String },
 }
 
+/// Fallible observer for ordered public events emitted during a live turn.
+///
+/// The runtime still captures every event in [`ContractOutcome`]. This edge
+/// lets a long-lived host forward the same event before the turn returns.
+pub trait RuntimeEventObserver: Send {
+    /// Observe one event in exact runtime order.
+    fn observe(&mut self, event: &Value) -> Result<(), RuntimeEventObserverError>;
+}
+
+/// A live event consumer could not accept the next runtime event.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error("runtime event observer failed: {message}")]
+pub struct RuntimeEventObserverError {
+    message: String,
+}
+
+impl RuntimeEventObserverError {
+    /// Construct an observer failure without exposing host-specific errors.
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into() }
+    }
+}
+
+struct NoopEventObserver;
+
+impl RuntimeEventObserver for NoopEventObserver {
+    fn observe(&mut self, _event: &Value) -> Result<(), RuntimeEventObserverError> {
+        Ok(())
+    }
+}
+
+struct PublicEventLog<'a, O: RuntimeEventObserver + ?Sized> {
+    events: Vec<Value>,
+    observer: &'a mut O,
+}
+
+impl<'a, O: RuntimeEventObserver + ?Sized> PublicEventLog<'a, O> {
+    fn new(observer: &'a mut O) -> Self {
+        Self { events: Vec::new(), observer }
+    }
+
+    fn push(&mut self, event: Value) -> Result<(), RuntimeError> {
+        self.observer.observe(&event)?;
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn into_events(self) -> Vec<Value> {
+        self.events
+    }
+}
+
 /// Execute one complete, provider-neutral agent turn.
 pub async fn run_turn<P, T>(
     request: AgentTurnRequest,
@@ -127,7 +183,24 @@ where
     P: Provider,
     T: ToolBroker,
 {
-    run_turn_with_limit(request, provider, tools, MAX_ATTEMPTS_PER_TURN).await
+    let mut observer = NoopEventObserver;
+    run_turn_with_limit_observed(request, provider, tools, MAX_ATTEMPTS_PER_TURN, &mut observer)
+        .await
+}
+
+/// Execute one turn while forwarding each captured public event immediately.
+pub async fn run_turn_observed<P, T, O>(
+    request: AgentTurnRequest,
+    provider: &mut P,
+    tools: &mut T,
+    observer: &mut O,
+) -> Result<ContractOutcome, RuntimeError>
+where
+    P: Provider,
+    T: ToolBroker,
+    O: RuntimeEventObserver + ?Sized,
+{
+    run_turn_with_limit_observed(request, provider, tools, MAX_ATTEMPTS_PER_TURN, observer).await
 }
 
 /// Execute one turn with an explicit provider-attempt budget.
@@ -140,6 +213,22 @@ pub async fn run_turn_with_limit<P, T>(
 where
     P: Provider,
     T: ToolBroker,
+{
+    let mut observer = NoopEventObserver;
+    run_turn_with_limit_observed(request, provider, tools, max_attempts, &mut observer).await
+}
+
+async fn run_turn_with_limit_observed<P, T, O>(
+    request: AgentTurnRequest,
+    provider: &mut P,
+    tools: &mut T,
+    max_attempts: usize,
+    observer: &mut O,
+) -> Result<ContractOutcome, RuntimeError>
+where
+    P: Provider,
+    T: ToolBroker,
+    O: RuntimeEventObserver + ?Sized,
 {
     if max_attempts == 0 {
         return Err(RuntimeError::InvalidTurn(
@@ -167,7 +256,7 @@ where
             }))
         })
         .collect::<Result<Vec<_>, serde_json::Error>>()?;
-    let mut public_events = Vec::new();
+    let mut events = PublicEventLog::new(observer);
     let mut usage = Usage::default();
     let mut attempt_count = 0_usize;
 
@@ -196,10 +285,10 @@ where
             transport,
             request: serde_json::to_value(provider_request)?,
         });
-        public_events.push(json!({
+        events.push(json!({
             "type": "provider.attempt_started",
             "attempt_id": attempt_id,
-        }));
+        }))?;
 
         let mut text = String::new();
         let mut reasoning = String::new();
@@ -216,28 +305,28 @@ where
             }
             match event {
                 ProviderEvent::MessageStart => {
-                    public_events.push(json!({
+                    events.push(json!({
                         "type": "message.start",
                         "attempt_id": attempt_id,
-                    }));
+                    }))?;
                 }
                 ProviderEvent::TextDelta { text: delta } => {
                     visible_output = true;
                     text.push_str(&delta);
-                    public_events.push(json!({
+                    events.push(json!({
                         "type": "message.delta",
                         "attempt_id": attempt_id,
                         "text": delta,
-                    }));
+                    }))?;
                 }
                 ProviderEvent::ReasoningDelta { text: delta } => {
                     visible_output = true;
                     reasoning.push_str(&delta);
-                    public_events.push(json!({
+                    events.push(json!({
                         "type": "reasoning.delta",
                         "attempt_id": attempt_id,
                         "text": delta,
-                    }));
+                    }))?;
                 }
                 ProviderEvent::ToolCallDelta { index, id, name, arguments_delta } => {
                     visible_output = true;
@@ -245,14 +334,14 @@ where
                     merge_stable_fragment(&mut partial.id, id.as_deref(), index, "id")?;
                     merge_stable_fragment(&mut partial.name, name.as_deref(), index, "name")?;
                     partial.arguments.push_str(&arguments_delta);
-                    public_events.push(json!({
+                    events.push(json!({
                         "type": "tool_call.delta",
                         "attempt_id": attempt_id,
                         "index": index,
                         "id": id,
                         "name": name,
                         "arguments_delta": arguments_delta,
-                    }));
+                    }))?;
                 }
                 ProviderEvent::Usage {
                     prompt_tokens,
@@ -266,11 +355,11 @@ where
                     usage.completion_tokens += completion_tokens;
                     usage.total_tokens += total_tokens;
                     usage.cached_tokens += cached_tokens;
-                    public_events.push(json!({
+                    events.push(json!({
                         "type": "usage",
                         "attempt_id": attempt_id,
                         "usage": attempt_usage,
-                    }));
+                    }))?;
                 }
                 ProviderEvent::Completed { finish_reason, provider_data } => {
                     terminal = Some(AttemptTerminal::Completed {
@@ -297,11 +386,11 @@ where
         }
 
         let Some(terminal) = terminal else {
-            public_events.push(json!({
+            events.push(json!({
                 "type": "provider.stream_failed",
                 "attempt_id": attempt_id,
                 "reason": "truncated",
-            }));
+            }))?;
             break TerminalOutcome {
                 status: TerminalStatus::Failed,
                 final_response: None,
@@ -313,11 +402,11 @@ where
 
         match terminal {
             AttemptTerminal::Error { reason } => {
-                public_events.push(json!({
+                events.push(json!({
                     "type": "provider.attempt_failed",
                     "attempt_id": attempt_id,
                     "reason": reason,
-                }));
+                }))?;
                 if attempt.error_policy == AttemptErrorPolicy::FallbackBeforeVisibleOutput
                     && !visible_output
                 {
@@ -336,11 +425,11 @@ where
                 };
             }
             AttemptTerminal::Cancelled { reason } => {
-                public_events.push(json!({
+                events.push(json!({
                     "type": "provider.cancelled",
                     "attempt_id": attempt_id,
                     "reason": reason,
-                }));
+                }))?;
                 break TerminalOutcome {
                     status: TerminalStatus::Cancelled,
                     final_response: None,
@@ -350,11 +439,11 @@ where
                 };
             }
             AttemptTerminal::Malformed { reason } => {
-                public_events.push(json!({
+                events.push(json!({
                     "type": "provider.protocol_error",
                     "attempt_id": attempt_id,
                     "reason": reason,
-                }));
+                }))?;
                 break TerminalOutcome {
                     status: TerminalStatus::Failed,
                     final_response: None,
@@ -376,12 +465,12 @@ where
                         "type": "append_assistant",
                         "message": serde_json::to_value(&assistant)?,
                     }));
-                    public_events.push(json!({
+                    events.push(json!({
                         "type": "message.complete",
                         "attempt_id": attempt_id,
                         "content": text,
                         "finish_reason": finish_reason,
-                    }));
+                    }))?;
                     break TerminalOutcome {
                         status: if finish_reason == "stop" {
                             TerminalStatus::Completed
@@ -408,16 +497,16 @@ where
                 for call in &planned {
                     persistence_intents.push(planned_intent(call));
                     if let Some(approval) = &call.approval {
-                        public_events.push(json!({
+                        events.push(json!({
                             "type": "approval.request",
                             "call_id": call.call_id,
                             "requirement": approval,
-                        }));
-                        public_events.push(json!({
+                        }))?;
+                        events.push(json!({
                             "type": "approval.resolved",
                             "call_id": call.call_id,
                             "decision": approval.decision,
-                        }));
+                        }))?;
                     }
                     if !call.approval.as_ref().is_some_and(domain::ApprovalRecord::denied) {
                         persistence_intents.push(json!({
@@ -425,12 +514,12 @@ where
                             "call_id": call.call_id,
                             "execution_key": call.execution_key,
                         }));
-                        public_events.push(json!({
+                        events.push(json!({
                             "type": "tool.start",
                             "call_id": call.call_id,
                             "name": call.name,
                             "execution_key": call.execution_key,
-                        }));
+                        }))?;
                     }
                 }
 
@@ -442,13 +531,13 @@ where
                     .collect::<HashMap<_, _>>();
                 for terminal in &completed {
                     persistence_intents.push(terminal_intent(terminal));
-                    public_events.push(json!({
+                    events.push(json!({
                         "type": "tool.complete",
                         "call_id": terminal.call_id,
                         "name": terminal.name,
                         "status": status_name(terminal.status),
                         "execution_key": terminal.execution_key,
-                    }));
+                    }))?;
                 }
 
                 let ordered = planned
@@ -477,10 +566,10 @@ where
                         "execution_key": terminal.execution_key,
                     })).collect::<Vec<_>>(),
                 }));
-                public_events.push(json!({
+                events.push(json!({
                     "type": "tool_result_batch.complete",
                     "call_ids": ordered.iter().map(|terminal| terminal.call_id.as_str()).collect::<Vec<_>>(),
-                }));
+                }))?;
             }
         }
     };
@@ -498,7 +587,7 @@ where
         provider_requests,
         semantic_conversation,
         persistence_intents,
-        public_events,
+        public_events: events.into_events(),
         usage,
         terminal_outcome,
     })

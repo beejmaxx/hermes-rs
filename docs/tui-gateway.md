@@ -50,7 +50,9 @@ submit a prompt, and reopen its durable transcript:
 `message.start`, zero or more `message.delta`, tool/reasoning events,
 `message.complete`, and `session.info`. The completed semantic turn is committed
 with the session's expected owner generation before `message.complete` is
-emitted.
+emitted. Provider deltas and tool lifecycle events cross a synchronous runtime
+observer boundary as they occur; the runtime also retains that exact sequence
+in its returned conformance log.
 
 The child-process integration test drives this entire path through real stdio,
 a local mocked OpenAI-compatible streaming endpoint, the actual runtime, and a
@@ -112,9 +114,6 @@ This is a usable vertical slice, not a claim of full gateway parity:
 - Upstream Hermes still hard-codes `python -m tui_gateway.entry`; the companion
   fork has the explicit process seam, but the normal `hermes --tui` launcher
   does not expose it yet.
-- Provider events are currently collected by the runtime and flushed in order
-  after the provider attempt finishes. The wire protocol is streaming-shaped,
-  but truly live token delivery requires a runtime event sink.
 - Session creation currently persists an empty frozen lineage immediately;
   Python delays that row until the first prompt.
 - Interrupt, steer/queue, approvals, image attachment, shell/slash execution,

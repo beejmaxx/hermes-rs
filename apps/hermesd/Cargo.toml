@@ -41,4 +41,5 @@ workspace = true
 [dev-dependencies]
 futures-executor.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 wiremock.workspace = true

@@ -18,6 +18,8 @@
   reconciliation, and an atomically written completion outbox
 - A minimal long-lived stdio JSON-RPC gateway with an end-to-end
   create/prompt/event/persist/resume proof
+- Live runtime event observation with fixture-wide sequence equality and a
+  pre-terminal delivery proof
 
 ## Current package decisions
 
@@ -45,6 +47,5 @@
 - Branching a new lineage when a user intentionally changes model or manifest
 - A polished `hermes --tui` launcher/config path for Rust (the companion Ink
   fork now has a direct developer process-selection seam)
-- Live runtime event delivery instead of ordered post-attempt flushing
 - Reading, writing, or migrating an existing Python Hermes database
 - A native plugin ABI

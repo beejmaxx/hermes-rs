@@ -180,6 +180,28 @@ pub(super) async fn execute_turn(
     scope: &str,
     state: &Path,
 ) -> anyhow::Result<ContractOutcome> {
+    execute_turn_inner(settings, semantic_history, prompt, scope, state, None).await
+}
+
+pub(super) async fn execute_turn_observed(
+    settings: &LiveSettings,
+    semantic_history: Vec<domain::SemanticMessage>,
+    prompt: &str,
+    scope: &str,
+    state: &Path,
+    observer: &mut dyn runtime::RuntimeEventObserver,
+) -> anyhow::Result<ContractOutcome> {
+    execute_turn_inner(settings, semantic_history, prompt, scope, state, Some(observer)).await
+}
+
+async fn execute_turn_inner(
+    settings: &LiveSettings,
+    semantic_history: Vec<domain::SemanticMessage>,
+    prompt: &str,
+    scope: &str,
+    state: &Path,
+    observer: Option<&mut dyn runtime::RuntimeEventObserver>,
+) -> anyhow::Result<ContractOutcome> {
     let api_key = read_api_key(settings.api_key_env.as_deref())?;
     let mut provider = OpenAiCompatibleProvider::new(&settings.base_url, api_key.clone())?;
     let tools_config = AgentToolsConfig::new(
@@ -196,20 +218,20 @@ pub(super) async fn execute_turn(
     let mut tools = JournaledToolBroker::new(tools, ledger, scope)?;
     let mut conversation = runtime::project_conversation(&semantic_history)?;
     conversation.push(ProviderMessage::User { content: prompt.into() });
-    runtime::run_turn(
-        AgentTurnRequest {
-            execution_scope: scope.into(),
-            transport: TransportKind::ChatCompletions,
-            model: settings.model.clone(),
-            system_prompt: Some(settings.system_prompt.clone()),
-            conversation,
-            tools: settings.tools.clone(),
-        },
-        &mut provider,
-        &mut tools,
-    )
-    .await
-    .map_err(Into::into)
+    let request = AgentTurnRequest {
+        execution_scope: scope.into(),
+        transport: TransportKind::ChatCompletions,
+        model: settings.model.clone(),
+        system_prompt: Some(settings.system_prompt.clone()),
+        conversation,
+        tools: settings.tools.clone(),
+    };
+    match observer {
+        Some(observer) => runtime::run_turn_observed(request, &mut provider, &mut tools, observer)
+            .await
+            .map_err(Into::into),
+        None => runtime::run_turn(request, &mut provider, &mut tools).await.map_err(Into::into),
+    }
 }
 
 pub(super) fn completed_response(outcome: &ContractOutcome) -> anyhow::Result<&str> {

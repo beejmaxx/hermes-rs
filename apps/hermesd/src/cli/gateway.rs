@@ -19,7 +19,7 @@ use serde_json::{Map, Value, json};
 use tokio::{io::AsyncBufReadExt, task::JoinHandle};
 
 use super::{
-    chat::{LiveSettings, RuntimeArgs, completed_response, execute_turn},
+    chat::{LiveSettings, RuntimeArgs, completed_response, execute_turn_observed},
     state::state_path,
 };
 use crate::adapters::SqliteSessionStore;
@@ -346,10 +346,16 @@ async fn run_session_turn(
         snapshot.config.session_id,
         snapshot.owner_generation.get()
     );
-    let outcome = execute_turn(settings, snapshot.conversation, prompt, &scope, state).await?;
-    for event in &outcome.public_events {
-        emit_runtime_event(writer, session_id, event);
-    }
+    let mut observer = GatewayRuntimeEventObserver { writer, session_id };
+    let outcome = execute_turn_observed(
+        settings,
+        snapshot.conversation,
+        prompt,
+        &scope,
+        state,
+        &mut observer,
+    )
+    .await?;
     let final_response = completed_response(&outcome)?.to_owned();
     let appended = outcome.semantic_conversation.get(previous_len..).ok_or_else(|| {
         anyhow::anyhow!("runtime returned a conversation shorter than its durable prefix")
@@ -374,17 +380,34 @@ async fn run_session_turn(
     Ok(())
 }
 
-fn emit_runtime_event(writer: &FrameWriter, session_id: &SessionId, event: &Value) {
+struct GatewayRuntimeEventObserver<'a> {
+    writer: &'a FrameWriter,
+    session_id: &'a SessionId,
+}
+
+impl runtime::RuntimeEventObserver for GatewayRuntimeEventObserver<'_> {
+    fn observe(&mut self, event: &Value) -> Result<(), runtime::RuntimeEventObserverError> {
+        emit_runtime_event(self.writer, self.session_id, event)
+            .map_err(|error| runtime::RuntimeEventObserverError::new(error.to_string()))
+    }
+}
+
+fn emit_runtime_event(
+    writer: &FrameWriter,
+    session_id: &SessionId,
+    event: &Value,
+) -> anyhow::Result<()> {
     let Some(kind) = event.get("type").and_then(Value::as_str) else {
-        return;
+        return Ok(());
     };
     match kind {
         "message.delta" | "reasoning.delta" => {
             if let Some(text) = event.get("text").and_then(Value::as_str) {
-                writer.event(kind, session_id, Some(json!({"text": text})));
+                writer.try_event(kind, session_id, Some(json!({"text": text})))?;
             }
+            Ok(())
         }
-        "tool.start" => writer.event(
+        "tool.start" => writer.try_event(
             kind,
             session_id,
             Some(json!({
@@ -393,7 +416,7 @@ fn emit_runtime_event(writer: &FrameWriter, session_id: &SessionId, event: &Valu
                 "args_text": "",
             })),
         ),
-        "tool.complete" => writer.event(
+        "tool.complete" => writer.try_event(
             kind,
             session_id,
             Some(json!({
@@ -402,7 +425,7 @@ fn emit_runtime_event(writer: &FrameWriter, session_id: &SessionId, event: &Valu
                 "summary": event.get("status"),
             })),
         ),
-        _ => {}
+        _ => Ok(()),
     }
 }
 
@@ -502,6 +525,15 @@ impl FrameWriter {
     }
 
     fn event(&self, kind: &str, session_id: &SessionId, payload: Option<Value>) {
-        let _ = self.send(&GatewayEventFrame::session(kind, session_id.as_str(), payload));
+        let _ = self.try_event(kind, session_id, payload);
+    }
+
+    fn try_event(
+        &self,
+        kind: &str,
+        session_id: &SessionId,
+        payload: Option<Value>,
+    ) -> anyhow::Result<()> {
+        self.send(&GatewayEventFrame::session(kind, session_id.as_str(), payload))
     }
 }
