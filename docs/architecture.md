@@ -21,6 +21,7 @@ ports <--------- runtime
   |                 |
   +---------- hermesd
                ├── CLI
+               ├── stdio JSON-RPC gateway
                ├── contract corpus support
                └── adapters: OpenAI-compatible HTTP, local tools, SQLite
 ```
@@ -117,6 +118,22 @@ steering, cancellation, reconnect-after-restart, and durable worker leases are
 not inferred from the old Kanban workflow. The persistence contract underneath
 those features is now explicit, but this tool continues to wait for its child
 until the supervisor and delivery host are wired end to end.
+
+## Long-lived client edge
+
+`hermesd gateway` exposes the first existing-client boundary without moving
+transport concerns into the kernel. It accepts Hermes's newline-delimited
+JSON-RPC envelope over stdio, creates frozen durable sessions, runs prompts
+through the same runtime as the CLI, projects ordered public events, commits a
+complete semantic turn with an expected generation, and reconstructs the
+transcript on resume.
+
+The initial behavior proof is deliberately vertical: it spawns the real binary,
+speaks the protocol over pipes, exercises a local streaming HTTP provider, and
+reopens the resulting SQLite session. It does not assert full parity with the
+large Python gateway. The supported subset and the missing process-selection
+seam in the Ink client are documented in
+[tui-gateway.md](tui-gateway.md).
 
 ## Explicit non-goals for the sketch
 

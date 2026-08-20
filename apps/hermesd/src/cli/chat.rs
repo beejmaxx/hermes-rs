@@ -23,12 +23,9 @@ use crate::adapters::{
 };
 use crate::cli::state::state_path;
 
-/// Arguments for one live chat turn.
-#[derive(Debug, clap::Args)]
-pub struct ChatArgs {
-    /// Durable session to create or resume. Omit for an ephemeral turn.
-    #[arg(long)]
-    session: Option<String>,
+/// Provider and immutable runtime settings shared by live hosts.
+#[derive(Clone, Debug, clap::Args)]
+pub(super) struct RuntimeArgs {
     /// Provider preset. Defaults to openai for a new or ephemeral session.
     #[arg(long, value_enum)]
     provider: Option<ProviderPreset>,
@@ -47,6 +44,17 @@ pub struct ChatArgs {
     /// Override the frozen system prompt for a new session.
     #[arg(long)]
     system: Option<String>,
+}
+
+/// Arguments for one live chat turn.
+#[derive(Debug, clap::Args)]
+pub struct ChatArgs {
+    /// Durable session to create or resume. Omit for an ephemeral turn.
+    #[arg(long)]
+    session: Option<String>,
+    /// Provider and immutable runtime settings.
+    #[command(flatten)]
+    runtime: RuntimeArgs,
     /// User prompt. Separate it from options with `--` when it begins with a dash.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true)]
     prompt: Vec<String>,
@@ -64,7 +72,8 @@ enum ProviderPreset {
     Custom,
 }
 
-struct LiveSettings {
+#[derive(Clone)]
+pub(super) struct LiveSettings {
     provider: ProviderPreset,
     base_url: String,
     api_key_env: Option<String>,
@@ -115,7 +124,7 @@ async fn run_ephemeral_chat(
     prompt: &str,
     state_override: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let settings = LiveSettings::for_new(arguments)?;
+    let settings = LiveSettings::for_new(&arguments.runtime)?;
     let scope = live_execution_scope()?;
     let state = state_path(state_override)?;
     let outcome = execute_turn(&settings, Vec::new(), prompt, &scope, &state).await?;
@@ -135,11 +144,11 @@ async fn run_durable_chat(
         .with_context(|| format!("could not open session state {}", state.display()))?;
     let (snapshot, settings) = match store.load(&session_id) {
         Ok(snapshot) => {
-            let settings = LiveSettings::for_resume(&arguments, &snapshot)?;
+            let settings = LiveSettings::for_resume(&arguments.runtime, &snapshot)?;
             (snapshot, settings)
         }
         Err(SessionStoreError::NotFound(_)) => {
-            let settings = LiveSettings::for_new(&arguments)?;
+            let settings = LiveSettings::for_new(&arguments.runtime)?;
             let config = settings.session_config(session_id)?;
             let snapshot = store.create(config)?;
             (snapshot, settings)
@@ -164,7 +173,7 @@ async fn run_durable_chat(
     Ok(())
 }
 
-async fn execute_turn(
+pub(super) async fn execute_turn(
     settings: &LiveSettings,
     semantic_history: Vec<domain::SemanticMessage>,
     prompt: &str,
@@ -203,7 +212,7 @@ async fn execute_turn(
     .map_err(Into::into)
 }
 
-fn completed_response(outcome: &ContractOutcome) -> anyhow::Result<&str> {
+pub(super) fn completed_response(outcome: &ContractOutcome) -> anyhow::Result<&str> {
     if outcome.terminal_outcome.status != TerminalStatus::Completed {
         anyhow::bail!(
             "agent turn ended with status {:?}: {}",
@@ -219,7 +228,7 @@ fn completed_response(outcome: &ContractOutcome) -> anyhow::Result<&str> {
 }
 
 impl LiveSettings {
-    fn for_new(arguments: &ChatArgs) -> anyhow::Result<Self> {
+    pub(super) fn for_new(arguments: &RuntimeArgs) -> anyhow::Result<Self> {
         let provider = arguments.provider.unwrap_or(ProviderPreset::OpenAi);
         let model = arguments
             .model
@@ -257,7 +266,7 @@ impl LiveSettings {
         })
     }
 
-    fn for_resume(arguments: &ChatArgs, snapshot: &SessionSnapshot) -> anyhow::Result<Self> {
+    fn for_resume(arguments: &RuntimeArgs, snapshot: &SessionSnapshot) -> anyhow::Result<Self> {
         let config = &snapshot.config;
         let provider = ProviderPreset::from_adapter(&config.provider_adapter)?;
         if arguments.provider.is_some_and(|value| value != provider) {
@@ -290,7 +299,7 @@ impl LiveSettings {
         })
     }
 
-    fn session_config(&self, session_id: SessionId) -> anyhow::Result<SessionConfig> {
+    pub(super) fn session_config(&self, session_id: SessionId) -> anyhow::Result<SessionConfig> {
         let tools_bytes = serde_json::to_vec(&self.tools)?;
         let engine = EngineId::new(format!(
             "rust-v1:chat-completions:{}:{}",
@@ -316,6 +325,18 @@ impl LiveSettings {
             system_prompt: self.system_prompt.clone(),
             tools: self.tools.clone(),
         })
+    }
+
+    pub(super) fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub(super) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(super) fn api_key_env(&self) -> Option<&str> {
+        self.api_key_env.as_deref()
     }
 }
 

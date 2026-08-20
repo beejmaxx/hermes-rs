@@ -105,6 +105,20 @@ and tool calls remain isolated, while its effects use a distinct durable
 journal scope. Existing sessions keep their frozen older tool catalog rather
 than gaining this capability mid-lineage.
 
-The bounded contracts, live durable path, and delegated child turns use the
-same runtime. Recovery of interrupted pending effects and durable child
-supervision are the next milestones.
+The same durable runtime is now also reachable through a minimal long-lived
+stdio JSON-RPC host compatible with the core Hermes TUI framing:
+
+```bash
+cargo run -p hermesd -- gateway \
+  --provider openrouter --model your-model-id --root .
+```
+
+This command emits protocol frames for a client rather than drawing a UI. It
+supports the create → prompt → event stream → durable resume path; the stock
+Hermes TUI does not select the Rust child yet. See
+[docs/tui-gateway.md](docs/tui-gateway.md) for the exact supported method set
+and current limitations.
+
+The bounded contracts, live durable path, delegated child turns, and gateway
+host all use the same runtime. Connecting durable background supervision and
+legal completion delivery is the next coordination milestone.

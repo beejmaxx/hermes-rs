@@ -16,6 +16,8 @@
   journaled under their own scopes
 - Durable delegation claims with owner generations, worker fencing, lease-expiry
   reconciliation, and an atomically written completion outbox
+- A minimal long-lived stdio JSON-RPC gateway with an end-to-end
+  create/prompt/event/persist/resume proof
 
 ## Current package decisions
 
@@ -41,7 +43,7 @@
   delegation state machine
 - Cancellation, steering, and explicitly replay-safe restart policy
 - Branching a new lineage when a user intentionally changes model or manifest
-- Public gateway/JSON-RPC integration with existing Hermes clients
-- Task claims, leases, fencing, inbox/outbox delivery, and coordinator recovery
+- Stock Ink-client process selection for the Rust stdio gateway
+- Live runtime event delivery instead of ordered post-attempt flushing
 - Reading, writing, or migrating an existing Python Hermes database
 - A native plugin ABI

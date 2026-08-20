@@ -4,6 +4,7 @@
 //! test payload is intentionally opaque to the domain.
 
 mod delegation;
+mod gateway;
 
 use domain::{LineageId, OwnerGeneration, PromptManifest, SemanticMessage, SessionId};
 use schemars::JsonSchema;
@@ -11,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use delegation::{DelegationCompletion, DelegationSnapshot};
+pub use gateway::{
+    GatewayErrorBody, GatewayEvent, GatewayEventFrame, GatewayFailure, GatewayRequest,
+    GatewaySuccess, JSON_RPC_VERSION,
+};
 
 /// Schema marker shared by the Python oracle and this Rust reader.
 pub const CONTRACT_SCHEMA_V1: &str = "hermes-rewrite-contract/v1";

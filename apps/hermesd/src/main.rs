@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use hermesd::{
-    cli::{ChatArgs, list_pending_effects, list_sessions, run_chat},
+    cli::{ChatArgs, GatewayArgs, list_pending_effects, list_sessions, run_chat, run_gateway},
     contracts::{ContractCorpus, scripted_agent_turn},
 };
 use protocol::ContractKind;
@@ -24,6 +24,8 @@ struct Cli {
 enum Command {
     /// Run a live turn, optionally creating or resuming a durable session.
     Chat(ChatArgs),
+    /// Serve the minimal Hermes JSON-RPC gateway over newline-delimited stdio.
+    Gateway(GatewayArgs),
     /// Inspect durable sessions.
     Session {
         #[command(subcommand)]
@@ -72,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Chat(arguments) => run_chat(arguments, cli.state.as_deref()).await,
+        Command::Gateway(arguments) => run_gateway(arguments, cli.state.as_deref()).await,
         Command::Session { command: SessionCommand::List } => list_sessions(cli.state.as_deref()),
         Command::Effect { command: EffectCommand::Pending } => {
             list_pending_effects(cli.state.as_deref())
