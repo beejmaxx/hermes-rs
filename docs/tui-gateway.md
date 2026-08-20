@@ -42,7 +42,7 @@ submit a prompt, and reopen its durable transcript:
 | Area | Methods |
 | --- | --- |
 | Startup | `setup.status`, `config.get`, `commands.catalog`, `wake.start` |
-| Sessions | `session.create`, `session.resume`, `session.activate`, `session.close`, `session.list`, `session.active_list`, `session.most_recent`, `session.usage` |
+| Sessions | `session.create`, `session.resume`, `session.activate`, `session.close`, `session.interrupt`, `session.list`, `session.active_list`, `session.most_recent`, `session.usage` |
 | Input | `input.detect_drop`, `complete.slash`, `complete.path`, `terminal.resize`, `system.battery` |
 | Turns | `prompt.submit` |
 
@@ -53,6 +53,11 @@ with the session's expected owner generation before `message.complete` is
 emitted. Provider deltas and tool lifecycle events cross a synchronous runtime
 observer boundary as they occur; the runtime also retains that exact sequence
 in its returned conformance log.
+
+`session.interrupt` cancels the live turn future, clears its in-memory ownership
+before emitting a terminal `message.complete`, and leaves any tool invocation
+that was durably planned but did not reach a terminal in the effect ledger for
+operator reconciliation. It does not silently replay or discard that effect.
 
 The child-process integration test drives this entire path through real stdio,
 a local mocked OpenAI-compatible streaming endpoint, the actual runtime, and a
@@ -116,7 +121,7 @@ This is a usable vertical slice, not a claim of full gateway parity:
   does not expose it yet.
 - Session creation currently persists an empty frozen lineage immediately;
   Python delays that row until the first prompt.
-- Interrupt, steer/queue, approvals, image attachment, shell/slash execution,
+- Steer/queue, approvals, image attachment, shell/slash execution,
   configuration mutation, and desktop/WebSocket methods are not implemented.
 - A process death during an in-flight foreground turn preserves journaled tool
   effects but does not yet materialize a resumable interrupted-turn marker.

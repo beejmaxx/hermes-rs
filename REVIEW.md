@@ -20,6 +20,8 @@
   create/prompt/event/persist/resume proof
 - Live runtime event observation with fixture-wide sequence equality and a
   pre-terminal delivery proof
+- Cooperative foreground interruption with cleanup-before-terminal ordering
+  and durable preservation of any unresolved tool-effect plan
 
 ## Current package decisions
 

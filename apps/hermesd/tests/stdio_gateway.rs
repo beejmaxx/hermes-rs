@@ -4,6 +4,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    time::Duration,
 };
 
 use hermesd::adapters::{AgentTools, SqliteSessionStore};
@@ -132,6 +133,83 @@ async fn stdio_client_can_create_prompt_and_resume_a_durable_session()
         .await
         .ok_or("request recording is disabled on the mock server")?;
     assert_eq!(requests.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stdio_client_can_interrupt_a_turn_without_leaving_the_session_busy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = tempdir()?;
+    let workspace = tempdir()?;
+    let root = fs::canonicalize(workspace.path())?;
+    let database = state_dir.path().join("state.db");
+    let server = MockServer::start().await;
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .respond_with(
+            streaming_text("This response should be cancelled.").set_delay(Duration::from_secs(2)),
+        )
+        .mount(&server)
+        .await;
+
+    let mut gateway = GatewayProcess::spawn(&[
+        "--state",
+        path_text(&database)?,
+        "gateway",
+        "--provider",
+        "custom",
+        "--base-url",
+        &format!("{}/v1", server.uri()),
+        "--model",
+        "test-model",
+        "--root",
+        path_text(&root)?,
+    ])?;
+    let _ready = gateway.read_frame()?;
+
+    gateway.request("create", "session.create", json!({}))?;
+    let created = gateway.read_response("create")?;
+    let session_id = created["result"]["session_id"]
+        .as_str()
+        .ok_or("session.create omitted session_id")?
+        .to_owned();
+
+    gateway.request(
+        "prompt",
+        "prompt.submit",
+        json!({"session_id": session_id, "text": "cancel this turn"}),
+    )?;
+    let accepted = gateway.read_response("prompt")?;
+    assert_eq!(accepted["result"]["status"], "streaming");
+    let started = gateway.read_frame()?;
+    assert_eq!(started["params"]["type"], "message.start");
+
+    gateway.request("interrupt", "session.interrupt", json!({"session_id": session_id}))?;
+    let mut acknowledged = false;
+    let mut interrupted = false;
+    while !acknowledged || !interrupted {
+        let frame = gateway.read_frame()?;
+        if frame.get("id").and_then(Value::as_str) == Some("interrupt") {
+            assert_eq!(frame["result"]["status"], "interrupted");
+            acknowledged = true;
+        }
+        if frame["method"] == "event"
+            && frame["params"]["session_id"] == session_id
+            && frame["params"]["type"] == "message.complete"
+        {
+            assert_eq!(frame["params"]["payload"]["status"], "interrupted");
+            interrupted = true;
+        }
+    }
+
+    gateway.request("resume", "session.resume", json!({"session_id": session_id}))?;
+    let resumed = gateway.read_response("resume")?;
+    assert_eq!(resumed["result"]["running"], false);
+    assert_eq!(resumed["result"]["message_count"], 0);
+    assert_eq!(resumed["result"]["messages"], json!([]));
+
+    gateway.shutdown()?;
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! Minimal long-lived stdio JSON-RPC host for existing Hermes clients.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{BufWriter, Write},
     path::Path,
     sync::{Arc, Mutex},
@@ -16,7 +16,7 @@ use protocol::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use tokio::{io::AsyncBufReadExt, task::JoinHandle};
+use tokio::{io::AsyncBufReadExt, sync::oneshot, task::JoinHandle};
 
 use super::{
     chat::{LiveSettings, RuntimeArgs, completed_response, execute_turn_observed},
@@ -50,6 +50,7 @@ pub async fn run_gateway(
         state,
         writer,
         busy: Arc::new(Mutex::new(HashSet::new())),
+        controls: Arc::new(Mutex::new(HashMap::new())),
         turns: Vec::new(),
     };
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
@@ -82,6 +83,7 @@ struct GatewayHost {
     state: std::path::PathBuf,
     writer: FrameWriter,
     busy: Arc<Mutex<HashSet<String>>>,
+    controls: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     turns: Vec<JoinHandle<()>>,
 }
 
@@ -127,6 +129,7 @@ impl GatewayHost {
             "config.get" => Ok(config_value(params)),
             "session.create" => self.create_session(params),
             "session.resume" | "session.activate" => self.resume_session(params),
+            "session.interrupt" => self.interrupt_session(params),
             "session.close" => {
                 let _ = session_param(params)?;
                 Ok(json!({"closed": true}))
@@ -254,6 +257,25 @@ impl GatewayHost {
         })
     }
 
+    fn interrupt_session(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
+        let sid = SessionId::new(session_param(params)?)
+            .map_err(|error| RpcError::new(4000, error.to_string()))?;
+        let mut store = SqliteSessionStore::open(&self.state).map_err(internal_error)?;
+        store.load(&sid).map_err(|error| match error {
+            SessionStoreError::NotFound(_) => RpcError::new(4040, error.to_string()),
+            other => internal_error(other),
+        })?;
+        let sender = self
+            .controls
+            .lock()
+            .map_err(|_| RpcError::new(5000, "turn-control lock poisoned"))?
+            .remove(sid.as_str());
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+        Ok(json!({"ok": true, "status": "interrupted"}))
+    }
+
     async fn submit(&mut self, id: Value, params: &Map<String, Value>) -> anyhow::Result<()> {
         let sid = match session_param(params).and_then(|sid| {
             SessionId::new(sid).map_err(|error| RpcError::new(4000, error.to_string()))
@@ -285,39 +307,56 @@ impl GatewayHost {
             return self.writer.send(&GatewayFailure::new(id, 4040, error.to_string()));
         }
 
-        self.writer.send(&GatewaySuccess::new(id, json!({"status": "streaming"})))?;
+        let (cancel_sender, cancel_receiver) = oneshot::channel();
+        self.controls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("turn-control lock poisoned"))?
+            .insert(sid.as_str().to_owned(), cancel_sender);
+        if let Err(error) =
+            self.writer.send(&GatewaySuccess::new(id, json!({"status": "streaming"})))
+        {
+            self.clear_turn(sid.as_str());
+            return Err(error);
+        }
         let settings = self.settings.clone();
         let state = self.state.clone();
         let writer = self.writer.clone();
         let busy = Arc::clone(&self.busy);
+        let controls = Arc::clone(&self.controls);
         self.turns.push(tokio::spawn(async move {
             writer.event("message.start", &sid, None);
-            if let Err(error) = run_session_turn(&settings, &state, &writer, &sid, &text).await {
-                writer.event(
-                    "message.complete",
-                    &sid,
-                    Some(json!({"text": format!("Error: {error}"), "status": "error"})),
-                );
-            }
+            let result = tokio::select! {
+                result = run_session_turn(&settings, &state, &writer, &sid, &text) => Some(result),
+                _ = cancel_receiver => None,
+            };
             if let Ok(mut active) = busy.lock() {
                 active.remove(sid.as_str());
             }
+            if let Ok(mut active) = controls.lock() {
+                active.remove(sid.as_str());
+            }
+            match result {
+                Some(Ok(final_response)) => {
+                    writer.event("message.complete", &sid, Some(json!({"text": final_response})))
+                }
+                Some(Err(error)) => writer.event(
+                    "message.complete",
+                    &sid,
+                    Some(json!({"text": format!("Error: {error}"), "status": "error"})),
+                ),
+                None => writer.event(
+                    "message.complete",
+                    &sid,
+                    Some(json!({"status": "interrupted", "text": ""})),
+                ),
+            }
+            writer.event("session.info", &sid, Some(session_info(&settings)));
         }));
         Ok(())
     }
 
     fn session_info(&self) -> Value {
-        json!({
-            "cwd": self.settings.root(),
-            "model": self.settings.model(),
-            "skills": {},
-            "tools": {
-                "workspace": ["read_file", "search_files"],
-                "delegation": ["delegate_task"],
-            },
-            "usage": zero_usage(self.settings.model()),
-            "version": env!("CARGO_PKG_VERSION"),
-        })
+        session_info(&self.settings)
     }
 
     fn is_busy(&self, session_id: &str) -> bool {
@@ -329,6 +368,13 @@ impl GatewayHost {
             busy.remove(session_id);
         }
     }
+
+    fn clear_turn(&self, session_id: &str) {
+        self.clear_busy(session_id);
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.remove(session_id);
+        }
+    }
 }
 
 async fn run_session_turn(
@@ -337,7 +383,7 @@ async fn run_session_turn(
     writer: &FrameWriter,
     session_id: &SessionId,
     prompt: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let mut store = SqliteSessionStore::open(state)?;
     let snapshot = store.load(session_id)?;
     let previous_len = snapshot.conversation.len();
@@ -361,23 +407,21 @@ async fn run_session_turn(
         anyhow::anyhow!("runtime returned a conversation shorter than its durable prefix")
     })?;
     store.append(session_id, snapshot.owner_generation, appended)?;
+    Ok(final_response)
+}
 
-    writer.event("message.complete", session_id, Some(json!({"text": final_response})));
-    writer.event(
-        "session.info",
-        session_id,
-        Some(json!({
-            "cwd": settings.root(),
-            "model": settings.model(),
-            "skills": {},
-            "tools": {
-                "workspace": ["read_file", "search_files"],
-                "delegation": ["delegate_task"],
-            },
-            "version": env!("CARGO_PKG_VERSION"),
-        })),
-    );
-    Ok(())
+fn session_info(settings: &LiveSettings) -> Value {
+    json!({
+        "cwd": settings.root(),
+        "model": settings.model(),
+        "skills": {},
+        "tools": {
+            "workspace": ["read_file", "search_files"],
+            "delegation": ["delegate_task"],
+        },
+        "usage": zero_usage(settings.model()),
+        "version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 struct GatewayRuntimeEventObserver<'a> {
