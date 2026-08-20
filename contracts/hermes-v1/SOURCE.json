@@ -1,0 +1,18 @@
+{
+  "schema_version": "hermes-rewrite-contract-bundle/v1",
+  "source_repository": "https://github.com/NousResearch/hermes-agent",
+  "source_base_revision": "87e32b6b30f3e5113e26ac7468319d000a3affac",
+  "source_contract_state": "uncommitted-draft-at-pinned-base",
+  "files": {
+    "anthropic_cache_control.json": "c84e9759698bee41a1700ba2c54a27f09283256e9b3fe63dcbefd03d66fd658c",
+    "approval_rejected.json": "67abb8e6e306ec3a64f6007e430d19d9afe9ba28c38752eb3c2a23a53c3f41ee",
+    "codex_app_server_projection.json": "8e00038314bb59e6251dfd043eeae40cf859c166471ad952dea730703df0199a",
+    "fallback_before_visible_output.json": "956ed5d89c255f3b41ee6fca4c197e50bde0ba2084845b310105bb1ee5793995",
+    "parallel_tools_out_of_order.json": "c1d2f20a9db0126abb8d684a76638571598d4b4fba517c3ff65ab6836c683991",
+    "plain_text.json": "3547cccfed3c3c47d2199d6059649fc8c9fbd343de9ca8e582c2ec66f07f56c0",
+    "provider_cancelled.json": "dbcb5c3d7f55fc9c9a89d8daac0506f21034bd428fb6f3adffa1e3a9d4386eb4",
+    "provider_malformed.json": "15f4f4f3173a71699e0da0bd93dbc5463f2d14b14bc8a5f1ce6418e1c388f02b",
+    "provider_truncated.json": "fa0980102c2e3343c5e3a256ce76c750a67ece695bb1172b26d2ad27328a92b9",
+    "tool_effect_outcome_unknown.json": "fa82a9a904e57c5d69e8efe055e43639560a814a76d58b0ad7973a2d29a0b65e"
+  }
+}

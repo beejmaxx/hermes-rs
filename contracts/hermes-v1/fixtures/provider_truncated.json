@@ -1,0 +1,98 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "provider_truncated",
+  "kind": "agent_turn",
+  "description": "A stream ending without a terminal event is classified and not persisted as an assistant turn.",
+  "evidence": [
+    "tests/run_agent/test_anthropic_mid_tool_call_drop.py",
+    "agent/conversation_loop.py"
+  ],
+  "input": {
+    "transport": "chat_completions",
+    "model": "test/model",
+    "system_prompt": "Be concise.",
+    "conversation": [
+      {"role": "user", "content": "Start answering."}
+    ],
+    "tools": [],
+    "tool_outcomes": {},
+    "provider_steps": [
+      {
+        "attempt_id": "attempt-1",
+        "events": [
+          {"type": "message_start"},
+          {"type": "text_delta", "text": "Half an answer"}
+        ]
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": "Start answering.",
+            "role": "user"
+          },
+          "type": "append_user"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-1",
+          "request": {
+            "messages": [
+              {
+                "content": "Be concise.",
+                "role": "system"
+              },
+              {
+                "content": "Start answering.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": []
+          },
+          "transport": "chat_completions"
+        }
+      ],
+      "public_events": [
+        {
+          "attempt_id": "attempt-1",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "type": "message.start"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "text": "Half an answer",
+          "type": "message.delta"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "reason": "truncated",
+          "type": "provider.stream_failed"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "content": "Start answering.",
+          "kind": "user"
+        }
+      ],
+      "terminal_outcome": {
+        "reason": "provider_stream_truncated",
+        "status": "failed",
+        "visible_output": true
+      },
+      "usage": {
+        "cached_tokens": 0,
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+}

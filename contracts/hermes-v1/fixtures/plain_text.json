@@ -1,0 +1,134 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "plain_text",
+  "kind": "agent_turn",
+  "description": "A single streamed text response becomes one durable assistant turn.",
+  "evidence": [
+    "agent/conversation_loop.py",
+    "agent/transports/chat_completions.py"
+  ],
+  "input": {
+    "transport": "chat_completions",
+    "model": "test/model",
+    "system_prompt": "You are helpful.",
+    "conversation": [
+      {"role": "user", "content": "Say hello."}
+    ],
+    "tools": [],
+    "tool_outcomes": {},
+    "provider_steps": [
+      {
+        "attempt_id": "attempt-1",
+        "events": [
+          {"type": "message_start"},
+          {"type": "text_delta", "text": "Hel"},
+          {"type": "text_delta", "text": "lo."},
+          {
+            "type": "usage",
+            "prompt_tokens": 8,
+            "completion_tokens": 2,
+            "total_tokens": 10,
+            "cached_tokens": 0
+          },
+          {"type": "completed", "finish_reason": "stop"}
+        ]
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": "Say hello.",
+            "role": "user"
+          },
+          "type": "append_user"
+        },
+        {
+          "message": {
+            "content": "Hello.",
+            "role": "assistant"
+          },
+          "type": "append_assistant"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-1",
+          "request": {
+            "messages": [
+              {
+                "content": "You are helpful.",
+                "role": "system"
+              },
+              {
+                "content": "Say hello.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": []
+          },
+          "transport": "chat_completions"
+        }
+      ],
+      "public_events": [
+        {
+          "attempt_id": "attempt-1",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "type": "message.start"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "text": "Hel",
+          "type": "message.delta"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "text": "lo.",
+          "type": "message.delta"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "type": "usage",
+          "usage": {
+            "cached_tokens": 0,
+            "completion_tokens": 2,
+            "prompt_tokens": 8,
+            "total_tokens": 10
+          }
+        },
+        {
+          "attempt_id": "attempt-1",
+          "content": "Hello.",
+          "finish_reason": "stop",
+          "type": "message.complete"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "content": "Say hello.",
+          "kind": "user"
+        },
+        {
+          "content": "Hello.",
+          "kind": "assistant"
+        }
+      ],
+      "terminal_outcome": {
+        "final_response": "Hello.",
+        "finish_reason": "stop",
+        "status": "completed"
+      },
+      "usage": {
+        "cached_tokens": 0,
+        "completion_tokens": 2,
+        "prompt_tokens": 8,
+        "total_tokens": 10
+      }
+    }
+}

@@ -1,0 +1,111 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "anthropic_cache_control",
+  "kind": "anthropic_request",
+  "description": "Native Anthropic request planning preserves cache markers and tool schemas.",
+  "evidence": [
+    "tests/run_agent/test_anthropic_prompt_cache_policy.py",
+    "agent/prompt_caching.py",
+    "agent/anthropic_adapter.py"
+  ],
+  "input": {
+    "attempt_id": "attempt-anthropic",
+    "model": "claude-sonnet-4-6",
+    "base_url": "https://api.anthropic.com",
+    "max_tokens": 512,
+    "tool_choice": "auto",
+    "messages": [
+      {"role": "system", "content": "STATIC PREFIX\nDynamic profile context."},
+      {"role": "user", "content": "Read status."}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_status",
+          "description": "Read status",
+          "parameters": {"type": "object", "properties": {}}
+        }
+      }
+    ],
+    "cache": {
+      "ttl": "5m",
+      "native_anthropic": true,
+      "static_system_prefix": "STATIC PREFIX\n",
+      "direct_native_tool_cache": true
+    }
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-anthropic",
+          "request": {
+            "max_tokens": 512,
+            "messages": [
+              {
+                "content": [
+                  {
+                    "cache_control": {
+                      "type": "ephemeral"
+                    },
+                    "text": "Read status.",
+                    "type": "text"
+                  }
+                ],
+                "role": "user"
+              }
+            ],
+            "model": "claude-sonnet-4-6",
+            "system": [
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "text": "STATIC PREFIX\n",
+                "type": "text"
+              },
+              {
+                "text": "Dynamic profile context.",
+                "type": "text"
+              }
+            ],
+            "tool_choice": {
+              "type": "auto"
+            },
+            "tools": [
+              {
+                "cache_control": {
+                  "type": "ephemeral"
+                },
+                "description": "Read status",
+                "input_schema": {
+                  "properties": {},
+                  "type": "object"
+                },
+                "name": "read_status"
+              }
+            ]
+          },
+          "transport": "anthropic_messages"
+        }
+      ],
+      "public_events": [],
+      "semantic_conversation": [
+        {
+          "content": "Read status.",
+          "kind": "user"
+        }
+      ],
+      "terminal_outcome": {
+        "status": "fixture_projected"
+      },
+      "usage": {
+        "cached_tokens": 0,
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+}

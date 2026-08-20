@@ -1,0 +1,87 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "provider_malformed",
+  "kind": "agent_turn",
+  "description": "A malformed provider terminal is a typed protocol failure.",
+  "evidence": [
+    "agent/transports/types.py",
+    "agent/conversation_loop.py"
+  ],
+  "input": {
+    "transport": "chat_completions",
+    "model": "test/model",
+    "system_prompt": "Be concise.",
+    "conversation": [
+      {"role": "user", "content": "Answer."}
+    ],
+    "tools": [],
+    "tool_outcomes": {},
+    "provider_steps": [
+      {
+        "attempt_id": "attempt-1",
+        "events": [
+          {"type": "malformed", "reason": "tool call missing required identifier"}
+        ]
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": "Answer.",
+            "role": "user"
+          },
+          "type": "append_user"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-1",
+          "request": {
+            "messages": [
+              {
+                "content": "Be concise.",
+                "role": "system"
+              },
+              {
+                "content": "Answer.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": []
+          },
+          "transport": "chat_completions"
+        }
+      ],
+      "public_events": [
+        {
+          "attempt_id": "attempt-1",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "reason": "tool call missing required identifier",
+          "type": "provider.protocol_error"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "content": "Answer.",
+          "kind": "user"
+        }
+      ],
+      "terminal_outcome": {
+        "reason": "tool call missing required identifier",
+        "status": "failed"
+      },
+      "usage": {
+        "cached_tokens": 0,
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+}

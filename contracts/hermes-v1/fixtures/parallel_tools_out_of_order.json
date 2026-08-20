@@ -1,0 +1,499 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "parallel_tools_out_of_order",
+  "kind": "agent_turn",
+  "description": "Parallel-safe calls finish out of order but enter provider history in call order.",
+  "evidence": [
+    "tests/run_agent/test_tool_call_incremental_persistence.py",
+    "agent/tool_executor.py"
+  ],
+  "input": {
+    "transport": "chat_completions",
+    "model": "test/model",
+    "system_prompt": "Read both files before answering.",
+    "conversation": [
+      {"role": "user", "content": "Compare a.txt and b.txt."}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "read_file",
+          "description": "Read a file",
+          "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+          }
+        }
+      }
+    ],
+    "tool_outcomes": {
+      "call-a": {
+        "name": "read_file",
+        "effect": "read_only",
+        "mode": "succeed",
+        "result": "alpha",
+        "receipt": "sha256:a",
+        "completion_order": 2
+      },
+      "call-b": {
+        "name": "read_file",
+        "effect": "read_only",
+        "mode": "succeed",
+        "result": "beta",
+        "receipt": "sha256:b",
+        "completion_order": 1
+      }
+    },
+    "provider_steps": [
+      {
+        "attempt_id": "attempt-1",
+        "events": [
+          {"type": "message_start"},
+          {"type": "reasoning_delta", "text": "Need both files."},
+          {
+            "type": "tool_call_delta",
+            "index": 0,
+            "id": "call-a",
+            "name": "read_file",
+            "arguments_delta": "{\"path\":\"a"
+          },
+          {
+            "type": "tool_call_delta",
+            "index": 1,
+            "id": "call-b",
+            "name": "read_file",
+            "arguments_delta": "{\"path\":\"b"
+          },
+          {"type": "tool_call_delta", "index": 0, "arguments_delta": ".txt\"}"},
+          {"type": "tool_call_delta", "index": 1, "arguments_delta": ".txt\"}"},
+          {
+            "type": "usage",
+            "prompt_tokens": 12,
+            "completion_tokens": 8,
+            "total_tokens": 20,
+            "cached_tokens": 4
+          },
+          {"type": "completed", "finish_reason": "tool_calls"}
+        ]
+      },
+      {
+        "attempt_id": "attempt-2",
+        "events": [
+          {"type": "message_start"},
+          {"type": "text_delta", "text": "a.txt says alpha; b.txt says beta."},
+          {
+            "type": "usage",
+            "prompt_tokens": 20,
+            "completion_tokens": 7,
+            "total_tokens": 27,
+            "cached_tokens": 12
+          },
+          {"type": "completed", "finish_reason": "stop"}
+        ]
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": "Compare a.txt and b.txt.",
+            "role": "user"
+          },
+          "type": "append_user"
+        },
+        {
+          "message": {
+            "content": null,
+            "reasoning": "Need both files.",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"path\":\"a.txt\"}",
+                  "name": "read_file"
+                },
+                "id": "call-a",
+                "type": "function"
+              },
+              {
+                "function": {
+                  "arguments": "{\"path\":\"b.txt\"}",
+                  "name": "read_file"
+                },
+                "id": "call-b",
+                "type": "function"
+              }
+            ]
+          },
+          "type": "append_assistant_tool_request"
+        },
+        {
+          "arguments": {
+            "path": "a.txt"
+          },
+          "call_id": "call-a",
+          "effect": "read_only",
+          "execution_key": "parallel_tools_out_of_order:call-a",
+          "name": "read_file",
+          "type": "tool_planned"
+        },
+        {
+          "call_id": "call-a",
+          "execution_key": "parallel_tools_out_of_order:call-a",
+          "type": "tool_started"
+        },
+        {
+          "arguments": {
+            "path": "b.txt"
+          },
+          "call_id": "call-b",
+          "effect": "read_only",
+          "execution_key": "parallel_tools_out_of_order:call-b",
+          "name": "read_file",
+          "type": "tool_planned"
+        },
+        {
+          "call_id": "call-b",
+          "execution_key": "parallel_tools_out_of_order:call-b",
+          "type": "tool_started"
+        },
+        {
+          "call_id": "call-b",
+          "content": "beta",
+          "effect": "read_only",
+          "execution_key": "parallel_tools_out_of_order:call-b",
+          "receipt": "sha256:b",
+          "type": "tool_succeeded"
+        },
+        {
+          "call_id": "call-a",
+          "content": "alpha",
+          "effect": "read_only",
+          "execution_key": "parallel_tools_out_of_order:call-a",
+          "receipt": "sha256:a",
+          "type": "tool_succeeded"
+        },
+        {
+          "results": [
+            {
+              "call_id": "call-a",
+              "content": "alpha",
+              "execution_key": "parallel_tools_out_of_order:call-a",
+              "name": "read_file",
+              "status": "succeeded"
+            },
+            {
+              "call_id": "call-b",
+              "content": "beta",
+              "execution_key": "parallel_tools_out_of_order:call-b",
+              "name": "read_file",
+              "status": "succeeded"
+            }
+          ],
+          "type": "append_tool_result_batch"
+        },
+        {
+          "message": {
+            "content": "a.txt says alpha; b.txt says beta.",
+            "role": "assistant"
+          },
+          "type": "append_assistant"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-1",
+          "request": {
+            "messages": [
+              {
+                "content": "Read both files before answering.",
+                "role": "system"
+              },
+              {
+                "content": "Compare a.txt and b.txt.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": [
+              {
+                "function": {
+                  "description": "Read a file",
+                  "name": "read_file",
+                  "parameters": {
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "type": "function"
+              }
+            ]
+          },
+          "transport": "chat_completions"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "request": {
+            "messages": [
+              {
+                "content": "Read both files before answering.",
+                "role": "system"
+              },
+              {
+                "content": "Compare a.txt and b.txt.",
+                "role": "user"
+              },
+              {
+                "content": null,
+                "reasoning": "Need both files.",
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"path\":\"a.txt\"}",
+                      "name": "read_file"
+                    },
+                    "id": "call-a",
+                    "type": "function"
+                  },
+                  {
+                    "function": {
+                      "arguments": "{\"path\":\"b.txt\"}",
+                      "name": "read_file"
+                    },
+                    "id": "call-b",
+                    "type": "function"
+                  }
+                ]
+              },
+              {
+                "content": "alpha",
+                "execution_key": "parallel_tools_out_of_order:call-a",
+                "role": "tool",
+                "status": "succeeded",
+                "tool_call_id": "call-a"
+              },
+              {
+                "content": "beta",
+                "execution_key": "parallel_tools_out_of_order:call-b",
+                "role": "tool",
+                "status": "succeeded",
+                "tool_call_id": "call-b"
+              }
+            ],
+            "model": "test/model",
+            "tools": [
+              {
+                "function": {
+                  "description": "Read a file",
+                  "name": "read_file",
+                  "parameters": {
+                    "properties": {
+                      "path": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "type": "function"
+              }
+            ]
+          },
+          "transport": "chat_completions"
+        }
+      ],
+      "public_events": [
+        {
+          "attempt_id": "attempt-1",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "type": "message.start"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "text": "Need both files.",
+          "type": "reasoning.delta"
+        },
+        {
+          "arguments_delta": "{\"path\":\"a",
+          "attempt_id": "attempt-1",
+          "id": "call-a",
+          "index": 0,
+          "name": "read_file",
+          "type": "tool_call.delta"
+        },
+        {
+          "arguments_delta": "{\"path\":\"b",
+          "attempt_id": "attempt-1",
+          "id": "call-b",
+          "index": 1,
+          "name": "read_file",
+          "type": "tool_call.delta"
+        },
+        {
+          "arguments_delta": ".txt\"}",
+          "attempt_id": "attempt-1",
+          "id": null,
+          "index": 0,
+          "name": null,
+          "type": "tool_call.delta"
+        },
+        {
+          "arguments_delta": ".txt\"}",
+          "attempt_id": "attempt-1",
+          "id": null,
+          "index": 1,
+          "name": null,
+          "type": "tool_call.delta"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "type": "usage",
+          "usage": {
+            "cached_tokens": 4,
+            "completion_tokens": 8,
+            "prompt_tokens": 12,
+            "total_tokens": 20
+          }
+        },
+        {
+          "call_id": "call-a",
+          "execution_key": "parallel_tools_out_of_order:call-a",
+          "name": "read_file",
+          "type": "tool.start"
+        },
+        {
+          "call_id": "call-b",
+          "execution_key": "parallel_tools_out_of_order:call-b",
+          "name": "read_file",
+          "type": "tool.start"
+        },
+        {
+          "call_id": "call-b",
+          "execution_key": "parallel_tools_out_of_order:call-b",
+          "name": "read_file",
+          "status": "succeeded",
+          "type": "tool.complete"
+        },
+        {
+          "call_id": "call-a",
+          "execution_key": "parallel_tools_out_of_order:call-a",
+          "name": "read_file",
+          "status": "succeeded",
+          "type": "tool.complete"
+        },
+        {
+          "call_ids": [
+            "call-a",
+            "call-b"
+          ],
+          "type": "tool_result_batch.complete"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "type": "message.start"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "text": "a.txt says alpha; b.txt says beta.",
+          "type": "message.delta"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "type": "usage",
+          "usage": {
+            "cached_tokens": 12,
+            "completion_tokens": 7,
+            "prompt_tokens": 20,
+            "total_tokens": 27
+          }
+        },
+        {
+          "attempt_id": "attempt-2",
+          "content": "a.txt says alpha; b.txt says beta.",
+          "finish_reason": "stop",
+          "type": "message.complete"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "content": "Compare a.txt and b.txt.",
+          "kind": "user"
+        },
+        {
+          "calls": [
+            {
+              "arguments": {
+                "path": "a.txt"
+              },
+              "id": "call-a",
+              "name": "read_file"
+            },
+            {
+              "arguments": {
+                "path": "b.txt"
+              },
+              "id": "call-b",
+              "name": "read_file"
+            }
+          ],
+          "content": null,
+          "kind": "assistant_tool_request",
+          "reasoning": "Need both files."
+        },
+        {
+          "kind": "tool_result_batch",
+          "results": [
+            {
+              "call_id": "call-a",
+              "content": "alpha",
+              "execution_key": "parallel_tools_out_of_order:call-a",
+              "status": "succeeded"
+            },
+            {
+              "call_id": "call-b",
+              "content": "beta",
+              "execution_key": "parallel_tools_out_of_order:call-b",
+              "status": "succeeded"
+            }
+          ]
+        },
+        {
+          "content": "a.txt says alpha; b.txt says beta.",
+          "kind": "assistant"
+        }
+      ],
+      "terminal_outcome": {
+        "final_response": "a.txt says alpha; b.txt says beta.",
+        "finish_reason": "stop",
+        "status": "completed"
+      },
+      "usage": {
+        "cached_tokens": 16,
+        "completion_tokens": 15,
+        "prompt_tokens": 32,
+        "total_tokens": 47
+      }
+    }
+}

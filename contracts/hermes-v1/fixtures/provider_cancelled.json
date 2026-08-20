@@ -1,0 +1,93 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "provider_cancelled",
+  "kind": "agent_turn",
+  "description": "Cancellation after a visible delta does not commit a partial assistant message.",
+  "evidence": [
+    "agent/conversation_loop.py",
+    "tests/run_agent/test_provider_fallback.py"
+  ],
+  "input": {
+    "transport": "chat_completions",
+    "model": "test/model",
+    "system_prompt": "Be concise.",
+    "conversation": [
+      {"role": "user", "content": "Write a long answer."}
+    ],
+    "tools": [],
+    "tool_outcomes": {},
+    "provider_steps": [
+      {
+        "attempt_id": "attempt-1",
+        "events": [
+          {"type": "text_delta", "text": "Partial"},
+          {"type": "cancelled", "reason": "user_interrupt"}
+        ]
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": "Write a long answer.",
+            "role": "user"
+          },
+          "type": "append_user"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-1",
+          "request": {
+            "messages": [
+              {
+                "content": "Be concise.",
+                "role": "system"
+              },
+              {
+                "content": "Write a long answer.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": []
+          },
+          "transport": "chat_completions"
+        }
+      ],
+      "public_events": [
+        {
+          "attempt_id": "attempt-1",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "text": "Partial",
+          "type": "message.delta"
+        },
+        {
+          "attempt_id": "attempt-1",
+          "reason": "user_interrupt",
+          "type": "provider.cancelled"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "content": "Write a long answer.",
+          "kind": "user"
+        }
+      ],
+      "terminal_outcome": {
+        "reason": "user_interrupt",
+        "status": "cancelled"
+      },
+      "usage": {
+        "cached_tokens": 0,
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+}

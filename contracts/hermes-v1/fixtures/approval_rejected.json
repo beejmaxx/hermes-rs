@@ -1,0 +1,310 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "approval_rejected",
+  "kind": "agent_turn",
+  "description": "A denied dangerous tool becomes a result without dispatching the tool.",
+  "evidence": [
+    "tests/tools/test_approval.py",
+    "tools/approval.py"
+  ],
+  "input": {
+    "transport": "chat_completions",
+    "model": "test/model",
+    "system_prompt": "Ask before process-control effects.",
+    "conversation": [
+      {"role": "user", "content": "Restart the service."}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "restart_service",
+          "description": "Restart a service",
+          "parameters": {"type": "object", "properties": {}}
+        }
+      }
+    ],
+    "tool_outcomes": {
+      "call-restart": {
+        "name": "restart_service",
+        "effect": "process_control",
+        "mode": "reject",
+        "reason": "user denied approval",
+        "approval": {"required": true, "decision": "deny", "principal": "user"},
+        "completion_order": 0
+      }
+    },
+    "provider_steps": [
+      {
+        "attempt_id": "attempt-1",
+        "events": [
+          {
+            "type": "tool_call_delta",
+            "index": 0,
+            "id": "call-restart",
+            "name": "restart_service",
+            "arguments_delta": "{}"
+          },
+          {"type": "completed", "finish_reason": "tool_calls"}
+        ]
+      },
+      {
+        "attempt_id": "attempt-2",
+        "events": [
+          {"type": "text_delta", "text": "The restart was not performed."},
+          {"type": "completed", "finish_reason": "stop"}
+        ]
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": "Restart the service.",
+            "role": "user"
+          },
+          "type": "append_user"
+        },
+        {
+          "message": {
+            "content": null,
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{}",
+                  "name": "restart_service"
+                },
+                "id": "call-restart",
+                "type": "function"
+              }
+            ]
+          },
+          "type": "append_assistant_tool_request"
+        },
+        {
+          "approval": {
+            "decision": "deny",
+            "principal": "user",
+            "required": true
+          },
+          "arguments": {},
+          "call_id": "call-restart",
+          "effect": "process_control",
+          "execution_key": "approval_rejected:call-restart",
+          "name": "restart_service",
+          "type": "tool_planned"
+        },
+        {
+          "call_id": "call-restart",
+          "content": "user denied approval",
+          "effect": "process_control",
+          "execution_key": "approval_rejected:call-restart",
+          "type": "tool_rejected"
+        },
+        {
+          "results": [
+            {
+              "call_id": "call-restart",
+              "content": "user denied approval",
+              "execution_key": "approval_rejected:call-restart",
+              "name": "restart_service",
+              "status": "rejected"
+            }
+          ],
+          "type": "append_tool_result_batch"
+        },
+        {
+          "message": {
+            "content": "The restart was not performed.",
+            "role": "assistant"
+          },
+          "type": "append_assistant"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-1",
+          "request": {
+            "messages": [
+              {
+                "content": "Ask before process-control effects.",
+                "role": "system"
+              },
+              {
+                "content": "Restart the service.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": [
+              {
+                "function": {
+                  "description": "Restart a service",
+                  "name": "restart_service",
+                  "parameters": {
+                    "properties": {},
+                    "type": "object"
+                  }
+                },
+                "type": "function"
+              }
+            ]
+          },
+          "transport": "chat_completions"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "request": {
+            "messages": [
+              {
+                "content": "Ask before process-control effects.",
+                "role": "system"
+              },
+              {
+                "content": "Restart the service.",
+                "role": "user"
+              },
+              {
+                "content": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{}",
+                      "name": "restart_service"
+                    },
+                    "id": "call-restart",
+                    "type": "function"
+                  }
+                ]
+              },
+              {
+                "content": "{\"execution_key\":\"approval_rejected:call-restart\",\"message\":\"user denied approval\",\"status\":\"rejected\"}",
+                "execution_key": "approval_rejected:call-restart",
+                "role": "tool",
+                "status": "rejected",
+                "tool_call_id": "call-restart"
+              }
+            ],
+            "model": "test/model",
+            "tools": [
+              {
+                "function": {
+                  "description": "Restart a service",
+                  "name": "restart_service",
+                  "parameters": {
+                    "properties": {},
+                    "type": "object"
+                  }
+                },
+                "type": "function"
+              }
+            ]
+          },
+          "transport": "chat_completions"
+        }
+      ],
+      "public_events": [
+        {
+          "attempt_id": "attempt-1",
+          "type": "provider.attempt_started"
+        },
+        {
+          "arguments_delta": "{}",
+          "attempt_id": "attempt-1",
+          "id": "call-restart",
+          "index": 0,
+          "name": "restart_service",
+          "type": "tool_call.delta"
+        },
+        {
+          "call_id": "call-restart",
+          "requirement": {
+            "decision": "deny",
+            "principal": "user",
+            "required": true
+          },
+          "type": "approval.request"
+        },
+        {
+          "call_id": "call-restart",
+          "decision": "deny",
+          "type": "approval.resolved"
+        },
+        {
+          "call_id": "call-restart",
+          "execution_key": "approval_rejected:call-restart",
+          "name": "restart_service",
+          "status": "rejected",
+          "type": "tool.complete"
+        },
+        {
+          "call_ids": [
+            "call-restart"
+          ],
+          "type": "tool_result_batch.complete"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "text": "The restart was not performed.",
+          "type": "message.delta"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "content": "The restart was not performed.",
+          "finish_reason": "stop",
+          "type": "message.complete"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "content": "Restart the service.",
+          "kind": "user"
+        },
+        {
+          "calls": [
+            {
+              "arguments": {},
+              "id": "call-restart",
+              "name": "restart_service"
+            }
+          ],
+          "content": null,
+          "kind": "assistant_tool_request"
+        },
+        {
+          "kind": "tool_result_batch",
+          "results": [
+            {
+              "call_id": "call-restart",
+              "content": "{\"execution_key\":\"approval_rejected:call-restart\",\"message\":\"user denied approval\",\"status\":\"rejected\"}",
+              "execution_key": "approval_rejected:call-restart",
+              "status": "rejected"
+            }
+          ]
+        },
+        {
+          "content": "The restart was not performed.",
+          "kind": "assistant"
+        }
+      ],
+      "terminal_outcome": {
+        "final_response": "The restart was not performed.",
+        "finish_reason": "stop",
+        "status": "completed"
+      },
+      "usage": {
+        "cached_tokens": 0,
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+}

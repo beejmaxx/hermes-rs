@@ -1,0 +1,194 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "codex_app_server_projection",
+  "kind": "codex_projection",
+  "description": "Codex app-server reasoning, command, and assistant items project deterministically.",
+  "evidence": [
+    "tests/agent/transports/test_codex_event_projector.py",
+    "tests/agent/test_codex_app_server_persist.py"
+  ],
+  "input": {
+    "attempt_id": "attempt-codex",
+    "provider_request": {
+      "method": "turn/start",
+      "params": {
+        "threadId": "thread-fixture",
+        "input": [{"type": "text", "text": "Run the check."}]
+      }
+    },
+    "notifications": [
+      {
+        "method": "item/completed",
+        "params": {
+          "item": {
+            "type": "reasoning",
+            "id": "reason-1",
+            "summary": ["Inspecting"],
+            "content": ["Run a harmless command"]
+          }
+        }
+      },
+      {
+        "method": "item/commandExecution/outputDelta",
+        "params": {"delta": "ok\n"}
+      },
+      {
+        "method": "item/completed",
+        "params": {
+          "item": {
+            "type": "commandExecution",
+            "id": "exec-1",
+            "command": "printf ok",
+            "cwd": "/workspace",
+            "status": "completed",
+            "aggregatedOutput": "ok\n",
+            "exitCode": 0
+          }
+        }
+      },
+      {
+        "method": "item/agentMessage/delta",
+        "params": {"delta": "Done"}
+      },
+      {
+        "method": "item/completed",
+        "params": {
+          "item": {"type": "agentMessage", "id": "message-1", "text": "Done."}
+        }
+      },
+      {
+        "method": "turn/completed",
+        "params": {
+          "tokenUsage": {
+            "inputTokens": 5,
+            "cachedInputTokens": 2,
+            "outputTokens": 2,
+            "totalTokens": 7
+          }
+        }
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": null,
+            "reasoning": "Inspecting\nRun a harmless command",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"command\":\"printf ok\",\"cwd\":\"/workspace\"}",
+                  "name": "exec_command"
+                },
+                "id": "codex_exec_exec-1",
+                "type": "function"
+              }
+            ]
+          },
+          "type": "append_projected_message"
+        },
+        {
+          "message": {
+            "content": "ok\n",
+            "role": "tool",
+            "tool_call_id": "codex_exec_exec-1"
+          },
+          "type": "append_projected_message"
+        },
+        {
+          "message": {
+            "content": "Done.",
+            "role": "assistant"
+          },
+          "type": "append_projected_message"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-codex",
+          "request": {
+            "method": "turn/start",
+            "params": {
+              "input": [
+                {
+                  "text": "Run the check.",
+                  "type": "text"
+                }
+              ],
+              "threadId": "thread-fixture"
+            }
+          },
+          "transport": "codex_app_server"
+        }
+      ],
+      "public_events": [
+        {
+          "item_id": "reason-1",
+          "item_type": "reasoning",
+          "type": "provider.item_completed"
+        },
+        {
+          "item_id": "exec-1",
+          "item_type": "commandExecution",
+          "type": "provider.item_completed"
+        },
+        {
+          "delta": "Done",
+          "method": "item/agentMessage/delta",
+          "type": "provider.delta"
+        },
+        {
+          "item_id": "message-1",
+          "item_type": "agentMessage",
+          "type": "provider.item_completed"
+        },
+        {
+          "type": "provider.turn_completed"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "calls": [
+            {
+              "arguments": {
+                "command": "printf ok",
+                "cwd": "/workspace"
+              },
+              "id": "codex_exec_exec-1",
+              "name": "exec_command"
+            }
+          ],
+          "content": null,
+          "kind": "assistant_tool_request",
+          "reasoning": "Inspecting\nRun a harmless command"
+        },
+        {
+          "kind": "tool_result_batch",
+          "results": [
+            {
+              "call_id": "codex_exec_exec-1",
+              "content": "ok\n",
+              "status": "observed"
+            }
+          ]
+        },
+        {
+          "content": "Done.",
+          "kind": "assistant"
+        }
+      ],
+      "terminal_outcome": {
+        "final_response": "Done.",
+        "status": "completed"
+      },
+      "usage": {
+        "cached_tokens": 2,
+        "completion_tokens": 2,
+        "prompt_tokens": 5,
+        "total_tokens": 7
+      }
+    }
+}

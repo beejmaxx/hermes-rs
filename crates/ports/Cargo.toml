@@ -1,0 +1,19 @@
+[package]
+name = "ports"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Kernel-owned ports for the experimental Hermes Rust backend"
+publish = false
+
+[dependencies]
+domain = { path = "../domain" }
+futures-core.workspace = true
+futures-util.workspace = true
+protocol = { path = "../protocol" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

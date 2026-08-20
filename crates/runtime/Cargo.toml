@@ -1,0 +1,24 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Effect-free agent turn runtime for the Hermes Rust backend"
+publish = false
+
+[dependencies]
+domain = { path = "../domain" }
+futures-util.workspace = true
+ports = { path = "../ports" }
+protocol = { path = "../protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
+testkit = { path = "../testkit" }
+
+[lints]
+workspace = true

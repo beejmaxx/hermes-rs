@@ -1,0 +1,25 @@
+[package]
+name = "hermes-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Offline developer CLI for the experimental Hermes Rust kernel"
+publish = false
+
+[[bin]]
+name = "hermes"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+futures-executor.workspace = true
+protocol = { path = "../../crates/protocol" }
+runtime = { path = "../../crates/runtime" }
+serde_json.workspace = true
+testkit = { path = "../../crates/testkit" }
+
+[lints]
+workspace = true

@@ -1,0 +1,323 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "tool_effect_outcome_unknown",
+  "kind": "agent_turn",
+  "description": "A crash after an external effect is durable uncertainty, never an optimistic retry.",
+  "evidence": [
+    "tests/run_agent/test_tool_call_incremental_persistence.py",
+    "tools/send_message_tool.py"
+  ],
+  "input": {
+    "transport": "chat_completions",
+    "model": "test/model",
+    "system_prompt": "Do not repeat uncertain external effects.",
+    "conversation": [
+      {"role": "user", "content": "Send the notification."}
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "send_message",
+          "description": "Send a notification",
+          "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"]
+          }
+        }
+      }
+    ],
+    "tool_outcomes": {
+      "call-send": {
+        "name": "send_message",
+        "effect": "external_mutation",
+        "mode": "crash_after_effect",
+        "error": "delivery may have occurred; reconciliation required",
+        "completion_order": 0
+      }
+    },
+    "provider_steps": [
+      {
+        "attempt_id": "attempt-1",
+        "events": [
+          {
+            "type": "tool_call_delta",
+            "index": 0,
+            "id": "call-send",
+            "name": "send_message",
+            "arguments_delta": "{\"text\":\"deploy complete\"}"
+          },
+          {"type": "completed", "finish_reason": "tool_calls"}
+        ]
+      },
+      {
+        "attempt_id": "attempt-2",
+        "events": [
+          {"type": "text_delta", "text": "Delivery status is uncertain; I will not resend it."},
+          {"type": "completed", "finish_reason": "stop"}
+        ]
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": "Send the notification.",
+            "role": "user"
+          },
+          "type": "append_user"
+        },
+        {
+          "message": {
+            "content": null,
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"text\":\"deploy complete\"}",
+                  "name": "send_message"
+                },
+                "id": "call-send",
+                "type": "function"
+              }
+            ]
+          },
+          "type": "append_assistant_tool_request"
+        },
+        {
+          "arguments": {
+            "text": "deploy complete"
+          },
+          "call_id": "call-send",
+          "effect": "external_mutation",
+          "execution_key": "tool_effect_outcome_unknown:call-send",
+          "name": "send_message",
+          "type": "tool_planned"
+        },
+        {
+          "call_id": "call-send",
+          "execution_key": "tool_effect_outcome_unknown:call-send",
+          "type": "tool_started"
+        },
+        {
+          "call_id": "call-send",
+          "content": "delivery may have occurred; reconciliation required",
+          "effect": "external_mutation",
+          "execution_key": "tool_effect_outcome_unknown:call-send",
+          "type": "tool_outcome_unknown"
+        },
+        {
+          "results": [
+            {
+              "call_id": "call-send",
+              "content": "delivery may have occurred; reconciliation required",
+              "execution_key": "tool_effect_outcome_unknown:call-send",
+              "name": "send_message",
+              "status": "outcome_unknown"
+            }
+          ],
+          "type": "append_tool_result_batch"
+        },
+        {
+          "message": {
+            "content": "Delivery status is uncertain; I will not resend it.",
+            "role": "assistant"
+          },
+          "type": "append_assistant"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-1",
+          "request": {
+            "messages": [
+              {
+                "content": "Do not repeat uncertain external effects.",
+                "role": "system"
+              },
+              {
+                "content": "Send the notification.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": [
+              {
+                "function": {
+                  "description": "Send a notification",
+                  "name": "send_message",
+                  "parameters": {
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "text"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "type": "function"
+              }
+            ]
+          },
+          "transport": "chat_completions"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "request": {
+            "messages": [
+              {
+                "content": "Do not repeat uncertain external effects.",
+                "role": "system"
+              },
+              {
+                "content": "Send the notification.",
+                "role": "user"
+              },
+              {
+                "content": null,
+                "role": "assistant",
+                "tool_calls": [
+                  {
+                    "function": {
+                      "arguments": "{\"text\":\"deploy complete\"}",
+                      "name": "send_message"
+                    },
+                    "id": "call-send",
+                    "type": "function"
+                  }
+                ]
+              },
+              {
+                "content": "{\"execution_key\":\"tool_effect_outcome_unknown:call-send\",\"message\":\"delivery may have occurred; reconciliation required\",\"status\":\"outcome_unknown\"}",
+                "execution_key": "tool_effect_outcome_unknown:call-send",
+                "role": "tool",
+                "status": "outcome_unknown",
+                "tool_call_id": "call-send"
+              }
+            ],
+            "model": "test/model",
+            "tools": [
+              {
+                "function": {
+                  "description": "Send a notification",
+                  "name": "send_message",
+                  "parameters": {
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "text"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "type": "function"
+              }
+            ]
+          },
+          "transport": "chat_completions"
+        }
+      ],
+      "public_events": [
+        {
+          "attempt_id": "attempt-1",
+          "type": "provider.attempt_started"
+        },
+        {
+          "arguments_delta": "{\"text\":\"deploy complete\"}",
+          "attempt_id": "attempt-1",
+          "id": "call-send",
+          "index": 0,
+          "name": "send_message",
+          "type": "tool_call.delta"
+        },
+        {
+          "call_id": "call-send",
+          "execution_key": "tool_effect_outcome_unknown:call-send",
+          "name": "send_message",
+          "type": "tool.start"
+        },
+        {
+          "call_id": "call-send",
+          "execution_key": "tool_effect_outcome_unknown:call-send",
+          "name": "send_message",
+          "status": "outcome_unknown",
+          "type": "tool.complete"
+        },
+        {
+          "call_ids": [
+            "call-send"
+          ],
+          "type": "tool_result_batch.complete"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "text": "Delivery status is uncertain; I will not resend it.",
+          "type": "message.delta"
+        },
+        {
+          "attempt_id": "attempt-2",
+          "content": "Delivery status is uncertain; I will not resend it.",
+          "finish_reason": "stop",
+          "type": "message.complete"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "content": "Send the notification.",
+          "kind": "user"
+        },
+        {
+          "calls": [
+            {
+              "arguments": {
+                "text": "deploy complete"
+              },
+              "id": "call-send",
+              "name": "send_message"
+            }
+          ],
+          "content": null,
+          "kind": "assistant_tool_request"
+        },
+        {
+          "kind": "tool_result_batch",
+          "results": [
+            {
+              "call_id": "call-send",
+              "content": "{\"execution_key\":\"tool_effect_outcome_unknown:call-send\",\"message\":\"delivery may have occurred; reconciliation required\",\"status\":\"outcome_unknown\"}",
+              "execution_key": "tool_effect_outcome_unknown:call-send",
+              "status": "outcome_unknown"
+            }
+          ]
+        },
+        {
+          "content": "Delivery status is uncertain; I will not resend it.",
+          "kind": "assistant"
+        }
+      ],
+      "terminal_outcome": {
+        "final_response": "Delivery status is uncertain; I will not resend it.",
+        "finish_reason": "stop",
+        "status": "completed"
+      },
+      "usage": {
+        "cached_tokens": 0,
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+}

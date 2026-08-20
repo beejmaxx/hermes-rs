@@ -1,0 +1,140 @@
+{
+  "$schema": "hermes-rewrite-contract/v1",
+  "id": "fallback_before_visible_output",
+  "kind": "agent_turn",
+  "description": "A retryable failure may fall back only before any model output is visible.",
+  "evidence": [
+    "tests/run_agent/test_provider_fallback.py",
+    "run_agent.py"
+  ],
+  "input": {
+    "transport": "chat_completions",
+    "model": "test/model",
+    "system_prompt": "Be concise.",
+    "conversation": [
+      {"role": "user", "content": "Answer once."}
+    ],
+    "tools": [],
+    "tool_outcomes": {},
+    "provider_steps": [
+      {
+        "attempt_id": "attempt-primary",
+        "on_error": "fallback",
+        "events": [
+          {"type": "error", "reason": "rate_limited"}
+        ]
+      },
+      {
+        "attempt_id": "attempt-fallback",
+        "events": [
+          {"type": "text_delta", "text": "Fallback answer."},
+          {"type": "completed", "finish_reason": "stop"}
+        ]
+      }
+    ]
+  },
+  "normalization": {},
+  "expected": {
+      "persistence_intents": [
+        {
+          "message": {
+            "content": "Answer once.",
+            "role": "user"
+          },
+          "type": "append_user"
+        },
+        {
+          "message": {
+            "content": "Fallback answer.",
+            "role": "assistant"
+          },
+          "type": "append_assistant"
+        }
+      ],
+      "provider_requests": [
+        {
+          "attempt_id": "attempt-primary",
+          "request": {
+            "messages": [
+              {
+                "content": "Be concise.",
+                "role": "system"
+              },
+              {
+                "content": "Answer once.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": []
+          },
+          "transport": "chat_completions"
+        },
+        {
+          "attempt_id": "attempt-fallback",
+          "request": {
+            "messages": [
+              {
+                "content": "Be concise.",
+                "role": "system"
+              },
+              {
+                "content": "Answer once.",
+                "role": "user"
+              }
+            ],
+            "model": "test/model",
+            "tools": []
+          },
+          "transport": "chat_completions"
+        }
+      ],
+      "public_events": [
+        {
+          "attempt_id": "attempt-primary",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-primary",
+          "reason": "rate_limited",
+          "type": "provider.attempt_failed"
+        },
+        {
+          "attempt_id": "attempt-fallback",
+          "type": "provider.attempt_started"
+        },
+        {
+          "attempt_id": "attempt-fallback",
+          "text": "Fallback answer.",
+          "type": "message.delta"
+        },
+        {
+          "attempt_id": "attempt-fallback",
+          "content": "Fallback answer.",
+          "finish_reason": "stop",
+          "type": "message.complete"
+        }
+      ],
+      "semantic_conversation": [
+        {
+          "content": "Answer once.",
+          "kind": "user"
+        },
+        {
+          "content": "Fallback answer.",
+          "kind": "assistant"
+        }
+      ],
+      "terminal_outcome": {
+        "final_response": "Fallback answer.",
+        "finish_reason": "stop",
+        "status": "completed"
+      },
+      "usage": {
+        "cached_tokens": 0,
+        "completion_tokens": 0,
+        "prompt_tokens": 0,
+        "total_tokens": 0
+      }
+    }
+}
