@@ -115,9 +115,10 @@ cargo run -p hermesd -- gateway \
 
 This command emits protocol frames for a client rather than drawing a UI. It
 supports the create → prompt → event stream → durable resume path; the stock
-Hermes TUI does not select the Rust child yet. See
+Hermes launcher does not select the Rust child yet, while the companion
+`beejmaxx/hermes-agent` fork can run it explicitly. See
 [docs/tui-gateway.md](docs/tui-gateway.md) for the exact supported method set
-and current limitations.
+launch command and current limitations.
 
 The bounded contracts, live durable path, delegated child turns, and gateway
 host all use the same runtime. Connecting durable background supervision and

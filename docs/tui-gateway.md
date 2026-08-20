@@ -73,12 +73,45 @@ cargo run -p hermesd -- gateway \
 It writes protocol frames—not a human interface—to stdout and reserves stderr
 for diagnostics. A normal user should launch it through a compatible client.
 
+## Use it with the Ink TUI
+
+The companion fork at
+[`beejmaxx/hermes-agent`](https://github.com/beejmaxx/hermes-agent) adds an
+explicit stdio process seam to the existing Ink client. Build `hermesd`, then
+run the TUI from the sibling checkout:
+
+```bash
+cd /absolute/path/to/hermes-rs
+cargo build -p hermesd
+
+cd /absolute/path/to/hermes-agent
+npm install --workspace ui-tui
+export OPENROUTER_API_KEY="..."
+npm start --workspace ui-tui -- \
+  --gateway-command /absolute/path/to/hermes-rs/target/debug/hermesd \
+  gateway \
+  --provider openrouter \
+  --model your-model-id \
+  --root /absolute/path/to/your/workspace
+```
+
+Everything after the executable path is forwarded as an exact argument token
+to `hermesd`; no shell parses the command. Add the global `--state PATH` before
+the `gateway` subcommand when an isolated database is useful. Omitting
+`--gateway-command` preserves the client's existing Python gateway behavior.
+
+This developer path already has a cross-repository smoke proof covering the
+real TypeScript client, the real Rust child process, a provider stream, a
+terminal event, SQLite persistence, and session resume. A polished
+`hermes --tui` configuration/launcher flow remains separate product work.
+
 ## Deliberate limitations
 
 This is a usable vertical slice, not a claim of full gateway parity:
 
-- The stock Hermes TUI still hard-codes `python -m tui_gateway.entry`; its
-  process-selection seam must be made explicit before it can spawn `hermesd`.
+- Upstream Hermes still hard-codes `python -m tui_gateway.entry`; the companion
+  fork has the explicit process seam, but the normal `hermes --tui` launcher
+  does not expose it yet.
 - Provider events are currently collected by the runtime and flushed in order
   after the provider attempt finishes. The wire protocol is streaming-shaped,
   but truly live token delivery requires a runtime event sink.

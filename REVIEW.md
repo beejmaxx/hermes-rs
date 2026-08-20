@@ -43,7 +43,8 @@
   delegation state machine
 - Cancellation, steering, and explicitly replay-safe restart policy
 - Branching a new lineage when a user intentionally changes model or manifest
-- Stock Ink-client process selection for the Rust stdio gateway
+- A polished `hermes --tui` launcher/config path for Rust (the companion Ink
+  fork now has a direct developer process-selection seam)
 - Live runtime event delivery instead of ordered post-attempt flushing
 - Reading, writing, or migrating an existing Python Hermes database
 - A native plugin ABI
