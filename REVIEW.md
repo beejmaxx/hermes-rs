@@ -10,6 +10,7 @@
 - Immutable session manifests and semantic conversation projection
 - SQLite sessions with owner-generation compare-and-swap
 - A write-ahead tool-effect ledger with duplicate-dispatch protection
+- Operator visibility into effects left pending by an interrupted process
 - Multi-process CLI session resume against the real runtime
 
 ## Current package decisions
@@ -30,7 +31,7 @@
 
 ## Deferred
 
-- Reconciliation policy and CLI visibility for effects left pending by a crash
+- Reconciliation policy for effects left pending by a crash
 - Branching a new lineage when a user intentionally changes model or manifest
 - Public gateway/JSON-RPC integration with existing Hermes clients
 - Task claims, leases, fencing, inbox/outbox delivery, and coordinator recovery

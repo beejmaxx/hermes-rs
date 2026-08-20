@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::{
     OpenAiCompatibleProvider, ReadOnlyLocalTools, SqliteEffectLedger, SqliteSessionStore,
 };
+use crate::cli::state::state_path;
 
 /// Arguments for one live chat turn.
 #[derive(Debug, clap::Args)]
@@ -360,14 +361,6 @@ fn read_api_key(variable: Option<&str>) -> anyhow::Result<Option<String>> {
                 })
         })
         .transpose()
-}
-
-fn state_path(override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    if let Some(path) = override_path {
-        return Ok(path.to_path_buf());
-    }
-    let home = dirs::home_dir().context("could not determine home directory for session state")?;
-    Ok(home.join(".hermes-rs/state.db"))
 }
 
 fn live_execution_scope() -> anyhow::Result<String> {

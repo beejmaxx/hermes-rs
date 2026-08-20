@@ -77,8 +77,10 @@ cannot partially extend the conversation.
 The journaled tool broker records an entire planned batch before executing any
 call, then records exactly one terminal result for each invocation. A process
 crash may therefore leave a visible `planned` record, but it cannot silently
-dispatch an unrecorded effect. The API key value is never persisted; only the
-name of its credential environment variable is part of session configuration.
+dispatch an unrecorded effect. `hermesd effect pending` exposes those records
+without guessing whether they are safe to retry. The API key value is never
+persisted; only the name of its credential environment variable is part of
+session configuration.
 
 The durable proof currently covers:
 

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use hermesd::{
-    cli::{ChatArgs, list_sessions, run_chat},
+    cli::{ChatArgs, list_pending_effects, list_sessions, run_chat},
     contracts::{ContractCorpus, scripted_agent_turn},
 };
 use protocol::ContractKind;
@@ -29,6 +29,11 @@ enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Inspect durable tool-effect records.
+    Effect {
+        #[command(subcommand)]
+        command: EffectCommand,
+    },
     /// Inspect the pinned language-neutral behavior contracts.
     Contract {
         #[command(subcommand)]
@@ -40,6 +45,12 @@ enum Command {
 enum SessionCommand {
     /// List durable sessions in the selected state database.
     List,
+}
+
+#[derive(Debug, Subcommand)]
+enum EffectCommand {
+    /// List plans that do not yet have a terminal or reconciliation disposition.
+    Pending,
 }
 
 #[derive(Debug, Subcommand)]
@@ -62,6 +73,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Chat(arguments) => run_chat(arguments, cli.state.as_deref()).await,
         Command::Session { command: SessionCommand::List } => list_sessions(cli.state.as_deref()),
+        Command::Effect { command: EffectCommand::Pending } => {
+            list_pending_effects(cli.state.as_deref())
+        }
         Command::Contract { command: ContractCommand::Check { bundle } } => {
             check_contracts(&bundle)
         }

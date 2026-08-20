@@ -86,11 +86,14 @@ cargo run -p hermesd -- chat --session demo \
   "Inspect this repository."
 cargo run -p hermesd -- chat --session demo "What did you find?"
 cargo run -p hermesd -- session list
+cargo run -p hermesd -- effect pending
 ```
 
 State defaults to `~/.hermes-rs/state.db`; use the global `--state PATH`
 option for an isolated database. The runtime writes every tool plan to its
 effect ledger before dispatch and records its terminal result afterward.
+`effect pending` exposes records left between those writes by an interrupted
+process; it does not retry them automatically.
 
 The bounded, deterministic single-agent proof and the live durable path use
 the same runtime. Recovery of interrupted pending effects and fenced
