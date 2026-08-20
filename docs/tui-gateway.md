@@ -59,6 +59,14 @@ before emitting a terminal `message.complete`, and leaves any tool invocation
 that was durably planned but did not reach a terminal in the effect ledger for
 operator reconciliation. It does not silently replay or discard that effect.
 
+Every accepted prompt also has a durable foreground claim. On process restart,
+the next exclusive gateway owner marks any abandoned `running` claim
+`outcome_unknown` before `gateway.ready`. Concurrent gateways targeting the
+same state database are rejected. `session.resume` returns the unchanged
+committed transcript, display-only recovery rows, and structured `recovery`
+metadata containing `auto_replayed: false`. See
+[foreground-turns.md](foreground-turns.md).
+
 The child-process integration test drives this entire path through real stdio,
 a local mocked OpenAI-compatible streaming endpoint, the actual runtime, and a
 real SQLite database. It then resumes the session and checks the reconstructed
@@ -123,8 +131,6 @@ This is a usable vertical slice, not a claim of full gateway parity:
   Python delays that row until the first prompt.
 - Steer/queue, approvals, image attachment, shell/slash execution,
   configuration mutation, and desktop/WebSocket methods are not implemented.
-- A process death during an in-flight foreground turn preserves journaled tool
-  effects but does not yet materialize a resumable interrupted-turn marker.
 
 Unsupported methods return JSON-RPC `-32601`; the gateway does not silently
 pretend that a capability exists. These gaps define follow-up behavior slices

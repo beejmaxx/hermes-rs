@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// SQLite-backed single-writer durable session repository.
 pub struct SqliteSessionStore {
@@ -147,7 +147,7 @@ impl SqliteSessionStore {
                     )
                     .map_err(storage_error)?;
             }
-            2 | SCHEMA_VERSION => {}
+            2 | 3 | SCHEMA_VERSION => {}
             other => {
                 return Err(SessionStoreError::Storage(format!(
                     "unsupported SQLite schema version {other}; expected {SCHEMA_VERSION}"
@@ -224,6 +224,37 @@ impl SqliteSessionStore {
                          ON delegation_completions(created_at_ms, event_id)
                          WHERE delivery_state = 'pending';
                      PRAGMA user_version = 3;
+                     COMMIT;",
+                )
+                .map_err(storage_error)?;
+        }
+        if version <= 3 {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE foreground_turns (
+                         turn_id TEXT PRIMARY KEY NOT NULL,
+                         session_id TEXT NOT NULL,
+                         owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+                         prompt TEXT NOT NULL CHECK (length(prompt) > 0),
+                         state TEXT NOT NULL,
+                         terminal_json TEXT,
+                         started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0),
+                         updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= started_at_ms),
+                         FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+                         CHECK (state IN (
+                             'running', 'completed', 'interrupted', 'failed', 'outcome_unknown'
+                         )),
+                         CHECK (
+                             (state = 'running' AND terminal_json IS NULL)
+                             OR (state != 'running' AND terminal_json IS NOT NULL)
+                         )
+                     );
+                     CREATE UNIQUE INDEX running_foreground_turn
+                         ON foreground_turns(session_id) WHERE state = 'running';
+                     CREATE INDEX latest_foreground_turn
+                         ON foreground_turns(session_id, started_at_ms DESC, turn_id DESC);
+                     PRAGMA user_version = 4;
                      COMMIT;",
                 )
                 .map_err(storage_error)?;
@@ -502,87 +533,14 @@ impl SessionStore for SqliteSessionStore {
         expected_generation: OwnerGeneration,
         messages: &[SemanticMessage],
     ) -> Result<SessionSnapshot, SessionStoreError> {
-        if messages.is_empty() {
-            return Err(SessionStoreError::Invalid("cannot append an empty turn".into()));
-        }
-        if !matches!(messages.first(), Some(SemanticMessage::User { .. }))
-            || !matches!(messages.last(), Some(SemanticMessage::Assistant { .. }))
-        {
-            return Err(SessionStoreError::Invalid(
-                "an appended turn must begin with user and end with assistant".into(),
-            ));
-        }
-
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_error)?;
-        let snapshot = load_snapshot(&transaction, session_id)?;
-        if snapshot.owner_generation != expected_generation {
-            return Err(SessionStoreError::Conflict {
-                session_id: session_id.clone(),
-                expected: expected_generation.get(),
-                actual: snapshot.owner_generation.get(),
-            });
-        }
-        let mut conversation = snapshot.conversation;
-        let start = conversation.len();
-        conversation.extend_from_slice(messages);
-        Conversation::new(conversation.clone())
-            .map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
-
-        {
-            let mut insert = transaction
-                .prepare(
-                    "INSERT INTO session_messages (session_id, sequence, message_json)
-                     VALUES (?1, ?2, ?3)",
-                )
-                .map_err(storage_error)?;
-            for (offset, message) in messages.iter().enumerate() {
-                let sequence = start.checked_add(offset).ok_or_else(|| {
-                    SessionStoreError::Invalid("session message count overflowed".into())
-                })?;
-                let message_json = serde_json::to_string(message).map_err(storage_error)?;
-                insert
-                    .execute(params![
-                        session_id.as_str(),
-                        usize_to_i64(sequence, "message sequence")?,
-                        message_json,
-                    ])
-                    .map_err(storage_error)?;
-            }
-        }
-        let next_generation = expected_generation
-            .get()
-            .checked_add(1)
-            .ok_or_else(|| SessionStoreError::Invalid("owner generation overflowed".into()))?;
-        let updated = transaction
-            .execute(
-                "UPDATE sessions
-                 SET owner_generation = ?1, message_count = ?2, updated_at = unixepoch()
-                 WHERE session_id = ?3 AND owner_generation = ?4",
-                params![
-                    to_i64(next_generation, "owner generation")?,
-                    usize_to_i64(conversation.len(), "message count")?,
-                    session_id.as_str(),
-                    to_i64(expected_generation.get(), "owner generation")?,
-                ],
-            )
-            .map_err(storage_error)?;
-        if updated != 1 {
-            return Err(SessionStoreError::Conflict {
-                session_id: session_id.clone(),
-                expected: expected_generation.get(),
-                actual: snapshot.owner_generation.get(),
-            });
-        }
+        let snapshot =
+            append_turn_in_transaction(&transaction, session_id, expected_generation, messages)?;
         transaction.commit().map_err(storage_error)?;
-        Ok(SessionSnapshot {
-            config: snapshot.config,
-            owner_generation: OwnerGeneration::new(next_generation)
-                .map_err(|error| SessionStoreError::Invalid(error.to_string()))?,
-            conversation,
-        })
+        Ok(snapshot)
     }
 
     fn list(&mut self) -> Result<Vec<SessionSummary>, SessionStoreError> {
@@ -619,7 +577,91 @@ impl SessionStore for SqliteSessionStore {
     }
 }
 
-fn load_snapshot(
+pub(super) fn append_turn_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: &SessionId,
+    expected_generation: OwnerGeneration,
+    messages: &[SemanticMessage],
+) -> Result<SessionSnapshot, SessionStoreError> {
+    if messages.is_empty() {
+        return Err(SessionStoreError::Invalid("cannot append an empty turn".into()));
+    }
+    if !matches!(messages.first(), Some(SemanticMessage::User { .. }))
+        || !matches!(messages.last(), Some(SemanticMessage::Assistant { .. }))
+    {
+        return Err(SessionStoreError::Invalid(
+            "an appended turn must begin with user and end with assistant".into(),
+        ));
+    }
+
+    let snapshot = load_snapshot(transaction, session_id)?;
+    if snapshot.owner_generation != expected_generation {
+        return Err(SessionStoreError::Conflict {
+            session_id: session_id.clone(),
+            expected: expected_generation.get(),
+            actual: snapshot.owner_generation.get(),
+        });
+    }
+    let mut conversation = snapshot.conversation;
+    let start = conversation.len();
+    conversation.extend_from_slice(messages);
+    Conversation::new(conversation.clone())
+        .map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
+
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO session_messages (session_id, sequence, message_json)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(storage_error)?;
+        for (offset, message) in messages.iter().enumerate() {
+            let sequence = start.checked_add(offset).ok_or_else(|| {
+                SessionStoreError::Invalid("session message count overflowed".into())
+            })?;
+            let message_json = serde_json::to_string(message).map_err(storage_error)?;
+            insert
+                .execute(params![
+                    session_id.as_str(),
+                    usize_to_i64(sequence, "message sequence")?,
+                    message_json,
+                ])
+                .map_err(storage_error)?;
+        }
+    }
+    let next_generation = expected_generation
+        .get()
+        .checked_add(1)
+        .ok_or_else(|| SessionStoreError::Invalid("owner generation overflowed".into()))?;
+    let updated = transaction
+        .execute(
+            "UPDATE sessions
+             SET owner_generation = ?1, message_count = ?2, updated_at = unixepoch()
+             WHERE session_id = ?3 AND owner_generation = ?4",
+            params![
+                to_i64(next_generation, "owner generation")?,
+                usize_to_i64(conversation.len(), "message count")?,
+                session_id.as_str(),
+                to_i64(expected_generation.get(), "owner generation")?,
+            ],
+        )
+        .map_err(storage_error)?;
+    if updated != 1 {
+        return Err(SessionStoreError::Conflict {
+            session_id: session_id.clone(),
+            expected: expected_generation.get(),
+            actual: snapshot.owner_generation.get(),
+        });
+    }
+    Ok(SessionSnapshot {
+        config: snapshot.config,
+        owner_generation: OwnerGeneration::new(next_generation)
+            .map_err(|error| SessionStoreError::Invalid(error.to_string()))?,
+        conversation,
+    })
+}
+
+pub(super) fn load_snapshot(
     connection: &Connection,
     session_id: &SessionId,
 ) -> Result<SessionSnapshot, SessionStoreError> {

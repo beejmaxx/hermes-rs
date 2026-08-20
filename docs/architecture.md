@@ -92,8 +92,15 @@ The durable proof currently covers:
 4. materialize the provider result batch in original call order; and
 5. resume a session from another CLI process without rebuilding its manifest.
 
-The next durable proof will reconcile interrupted pending effects. The
-background-delegation substrate now has generation-guarded claims, worker
+The stdio gateway additionally gives every accepted foreground prompt a
+generation-guarded durable claim. Successful completion terminalizes that
+claim in the same transaction that appends the semantic turn. Interrupts and
+known failures retain displayable attempt records without mutating conversation
+history. Gateway startup reconciles a leftover `running` claim to
+`outcome_unknown` and surfaces it on resume without automatic replay. See
+[foreground-turns.md](foreground-turns.md).
+
+The background-delegation substrate has generation-guarded claims, worker
 leases and fencing, `outcome_unknown` reconciliation, and a claimed completion
 outbox. See [durable-delegation.md](durable-delegation.md). A long-lived host
 still needs to connect that state machine to child execution and legal
@@ -123,10 +130,11 @@ until the supervisor and delivery host are wired end to end.
 
 `hermesd gateway` exposes the first existing-client boundary without moving
 transport concerns into the kernel. It accepts Hermes's newline-delimited
-JSON-RPC envelope over stdio, creates frozen durable sessions, runs prompts
-through the same runtime as the CLI, projects ordered public events, commits a
-complete semantic turn with an expected generation, and reconstructs the
-transcript on resume.
+JSON-RPC envelope over stdio, creates frozen durable sessions, claims prompts
+before provider work, runs them through the same runtime as the CLI, projects
+ordered public events, commits a complete semantic turn with an expected
+generation, and reconstructs both the transcript and uncommitted recovery
+records on resume.
 
 The initial behavior proof is deliberately vertical: it spawns the real binary,
 speaks the protocol over pipes, exercises a local streaming HTTP provider, and

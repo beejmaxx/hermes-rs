@@ -4,14 +4,14 @@ use std::pin::Pin;
 
 use domain::{
     CompletionEventId, DelegationId, DelegationSpec, DelegationTerminal, DelegationWorkerId,
-    DeliveryClaimId, FencingToken, OwnerGeneration, PlannedToolCall, SemanticMessage, SessionId,
-    ToolCall, ToolTerminal,
+    DeliveryClaimId, FencingToken, ForegroundTurnId, ForegroundTurnSpec, ForegroundTurnTerminal,
+    OwnerGeneration, PlannedToolCall, SemanticMessage, SessionId, ToolCall, ToolTerminal,
 };
 use futures_core::Stream;
 use futures_util::future::BoxFuture;
 use protocol::{
-    ChatCompletionsRequest, DelegationCompletion, DelegationSnapshot, PendingEffect, ProviderEvent,
-    SessionConfig, SessionSnapshot, SessionSummary,
+    ChatCompletionsRequest, DelegationCompletion, DelegationSnapshot, ForegroundTurnSnapshot,
+    PendingEffect, ProviderEvent, SessionConfig, SessionSnapshot, SessionSummary,
 };
 use thiserror::Error;
 
@@ -136,6 +136,89 @@ pub trait SessionStore: Send {
 
     /// List compact session records, newest first.
     fn list(&mut self) -> Result<Vec<SessionSummary>, SessionStoreError>;
+}
+
+/// A durable foreground-turn mutation failed.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ForegroundTurnStoreError {
+    /// A start operation reused an existing attempt identity.
+    #[error("foreground turn already exists: {0}")]
+    AlreadyExists(ForegroundTurnId),
+    /// Another running foreground attempt already owns the session.
+    #[error("session already has a running foreground turn: {0}")]
+    SessionBusy(SessionId),
+    /// The referenced session does not exist.
+    #[error("session not found: {0}")]
+    SessionNotFound(SessionId),
+    /// The referenced attempt does not exist.
+    #[error("foreground turn not found: {0}")]
+    NotFound(ForegroundTurnId),
+    /// Another writer advanced the session authority generation first.
+    #[error("session {session_id} write conflict: expected generation {expected}, actual {actual}")]
+    GenerationConflict {
+        /// Conflicting session.
+        session_id: SessionId,
+        /// Generation supplied by the caller.
+        expected: u64,
+        /// Current durable generation.
+        actual: u64,
+    },
+    /// The attempt was not running when a terminal mutation arrived.
+    #[error("foreground turn {turn_id} cannot transition from state {state}")]
+    NotRunning {
+        /// Conflicting attempt.
+        turn_id: ForegroundTurnId,
+        /// Current durable state name.
+        state: String,
+    },
+    /// Input or stored foreground-turn state violated an invariant.
+    #[error("invalid foreground turn state: {0}")]
+    Invalid(String),
+    /// The foreground-turn repository failed.
+    #[error("foreground turn storage failed: {0}")]
+    Storage(String),
+}
+
+/// Durable foreground ownership, terminalization, and crash reconciliation.
+pub trait ForegroundTurnStore: Send {
+    /// Claim a session generation before any provider or tool work begins.
+    fn start(
+        &mut self,
+        spec: ForegroundTurnSpec,
+        expected_generation: OwnerGeneration,
+        started_at_ms: u64,
+    ) -> Result<ForegroundTurnSnapshot, ForegroundTurnStoreError>;
+
+    /// Atomically append one complete semantic turn and terminalize its claim.
+    fn complete(
+        &mut self,
+        turn_id: &ForegroundTurnId,
+        expected_generation: OwnerGeneration,
+        messages: &[SemanticMessage],
+        completed_at_ms: u64,
+    ) -> Result<SessionSnapshot, ForegroundTurnStoreError>;
+
+    /// Terminalize an uncommitted attempt without changing session history.
+    fn terminate(
+        &mut self,
+        turn_id: &ForegroundTurnId,
+        expected_generation: OwnerGeneration,
+        outcome: ForegroundTurnTerminal,
+        completed_at_ms: u64,
+    ) -> Result<ForegroundTurnSnapshot, ForegroundTurnStoreError>;
+
+    /// Load the most recently accepted attempt for a session, when one exists.
+    fn latest(
+        &mut self,
+        session_id: &SessionId,
+    ) -> Result<Option<ForegroundTurnSnapshot>, ForegroundTurnStoreError>;
+
+    /// Conservatively terminalize every claim abandoned by a previous host.
+    fn reconcile_running(
+        &mut self,
+        reason: &str,
+        completed_at_ms: u64,
+    ) -> Result<Vec<ForegroundTurnSnapshot>, ForegroundTurnStoreError>;
 }
 
 /// A durable background-delegation operation failed.

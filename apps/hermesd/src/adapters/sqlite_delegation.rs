@@ -991,7 +991,8 @@ mod tests {
 
         let connection = Connection::open(&database)?;
         connection.execute_batch(
-            "DROP TABLE delegation_completions;
+            "DROP TABLE foreground_turns;
+             DROP TABLE delegation_completions;
              DROP TABLE delegations;
              PRAGMA user_version = 2;",
         )?;
@@ -1003,12 +1004,14 @@ mod tests {
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))?;
         let table_count = connection.query_row(
             "SELECT count(*) FROM sqlite_master
-             WHERE type = 'table' AND name IN ('delegations', 'delegation_completions')",
+             WHERE type = 'table' AND name IN (
+                 'delegations', 'delegation_completions', 'foreground_turns'
+             )",
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(version, 3);
-        assert_eq!(table_count, 2);
+        assert_eq!(version, 4);
+        assert_eq!(table_count, 3);
 
         let mut sessions = SqliteSessionStore::open(&database)?;
         assert_eq!(sessions.load(&SessionId::new("existing")?)?.config.model, "test-model");

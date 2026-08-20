@@ -114,8 +114,10 @@ cargo run -p hermesd -- gateway \
 ```
 
 This command emits protocol frames for a client rather than drawing a UI. It
-supports the create → prompt → event stream → durable resume path; the stock
-Hermes launcher does not select the Rust child yet, while the companion
+supports the create → prompt → live event stream → atomic commit → durable
+resume path. Accepted prompts are claimed before provider work; a gateway
+restart exposes abandoned work as `outcome_unknown` without replaying it. The
+stock Hermes launcher does not select the Rust child yet, while the companion
 `beejmaxx/hermes-agent` fork can run it explicitly. See
 [docs/tui-gateway.md](docs/tui-gateway.md) for the exact supported method set
 launch command and current limitations.

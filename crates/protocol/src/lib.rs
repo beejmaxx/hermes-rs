@@ -4,6 +4,7 @@
 //! test payload is intentionally opaque to the domain.
 
 mod delegation;
+mod foreground;
 mod gateway;
 
 use domain::{LineageId, OwnerGeneration, PromptManifest, SemanticMessage, SessionId};
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use delegation::{DelegationCompletion, DelegationSnapshot};
+pub use foreground::ForegroundTurnSnapshot;
 pub use gateway::{
     GatewayErrorBody, GatewayEvent, GatewayEventFrame, GatewayFailure, GatewayRequest,
     GatewaySuccess, JSON_RPC_VERSION,

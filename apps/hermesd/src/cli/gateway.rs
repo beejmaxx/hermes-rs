@@ -2,17 +2,22 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    fs::{File, OpenOptions},
     io::{BufWriter, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
-use domain::{SemanticMessage, SessionId};
-use ports::{SessionStore, SessionStoreError};
+use domain::{
+    ForegroundTurnId, ForegroundTurnSpec, ForegroundTurnState, ForegroundTurnTerminal,
+    OwnerGeneration, SemanticMessage, SessionId,
+};
+use ports::{ForegroundTurnStore, ForegroundTurnStoreError, SessionStore, SessionStoreError};
 use protocol::{
-    GatewayEventFrame, GatewayFailure, GatewayRequest, GatewaySuccess, JSON_RPC_VERSION,
+    ForegroundTurnSnapshot, GatewayEventFrame, GatewayFailure, GatewayRequest, GatewaySuccess,
+    JSON_RPC_VERSION,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -22,7 +27,10 @@ use super::{
     chat::{LiveSettings, RuntimeArgs, completed_response, execute_turn_observed},
     state::state_path,
 };
-use crate::adapters::SqliteSessionStore;
+use crate::adapters::{SqliteForegroundTurnStore, SqliteSessionStore};
+
+const RESTART_RECONCILIATION_REASON: &str =
+    "owning gateway exited before recording a foreground turn terminal";
 
 /// Arguments for the long-lived stdio gateway host.
 #[derive(Debug, clap::Args)]
@@ -39,10 +47,18 @@ pub async fn run_gateway(
 ) -> anyhow::Result<()> {
     let settings = LiveSettings::for_new(&arguments.runtime)?;
     let state = state_path(state_override)?;
+    let _lease = GatewayLease::acquire(&state)?;
+    let reconciled = SqliteForegroundTurnStore::open(&state)?
+        .reconcile_running(RESTART_RECONCILIATION_REASON, unix_time_ms()?)?;
     let writer = FrameWriter::new();
     writer.send(&GatewayEventFrame::global(
         "gateway.ready",
-        Some(json!({"skin": {}, "change_events": false, "backend": "hermes-rs"})),
+        Some(json!({
+            "skin": {},
+            "change_events": false,
+            "backend": "hermes-rs",
+            "reconciled_foreground_turns": reconciled.len(),
+        })),
     ))?;
 
     let mut host = GatewayHost {
@@ -85,6 +101,46 @@ struct GatewayHost {
     busy: Arc<Mutex<HashSet<String>>>,
     controls: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     turns: Vec<JoinHandle<()>>,
+}
+
+enum TurnExit {
+    Completed(String),
+    Failed(String),
+    Interrupted,
+}
+
+struct GatewayLease {
+    _file: File,
+}
+
+impl GatewayLease {
+    fn acquire(state: &Path) -> anyhow::Result<Self> {
+        let lock_path = gateway_lock_path(state);
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("could not create gateway state directory {}", parent.display())
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("could not open gateway lease {}", lock_path.display()))?;
+        file.try_lock().with_context(|| {
+            format!("could not acquire exclusive gateway ownership for {}", state.display())
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn gateway_lock_path(state: &Path) -> PathBuf {
+    let mut path = state.as_os_str().to_os_string();
+    path.push(".gateway.lock");
+    PathBuf::from(path)
 }
 
 impl GatewayHost {
@@ -198,14 +254,22 @@ impl GatewayHost {
             SessionStoreError::NotFound(_) => RpcError::new(4040, error.to_string()),
             other => internal_error(other),
         })?;
+        let latest = SqliteForegroundTurnStore::open(&self.state)
+            .map_err(internal_error)?
+            .latest(&session_id)
+            .map_err(internal_error)?;
+        let busy = self.is_busy(session_id.as_str());
+        let projection = resume_projection(&snapshot.conversation, latest.as_ref(), busy);
         Ok(json!({
             "session_id": session_id,
             "resumed": session_id,
             "session_key": session_id,
             "message_count": snapshot.conversation.len(),
-            "messages": transcript(&snapshot.conversation),
-            "running": self.is_busy(session_id.as_str()),
-            "status": if self.is_busy(session_id.as_str()) { "working" } else { "idle" },
+            "messages": projection.messages,
+            "inflight": projection.inflight,
+            "recovery": projection.recovery,
+            "running": busy,
+            "status": if busy { "working" } else { "idle" },
             "started_at": 0,
             "info": self.session_info(),
         }))
@@ -295,27 +359,72 @@ impl GatewayHost {
                 ));
             }
         };
+        let turn_id = fresh_turn_id()?;
+        let started_at_ms = unix_time_ms()?;
         {
             let mut busy = self.busy.lock().map_err(|_| anyhow::anyhow!("busy lock poisoned"))?;
             if !busy.insert(sid.as_str().to_owned()) {
                 return self.writer.send(&GatewayFailure::new(id, 4090, "session busy"));
             }
         }
-        let mut store = SqliteSessionStore::open(&self.state)?;
-        if let Err(error) = store.load(&sid) {
-            self.clear_busy(sid.as_str());
-            return self.writer.send(&GatewayFailure::new(id, 4040, error.to_string()));
-        }
+        let mut store = match SqliteSessionStore::open(&self.state) {
+            Ok(store) => store,
+            Err(error) => {
+                self.clear_busy(sid.as_str());
+                return Err(error.into());
+            }
+        };
+        let snapshot = match store.load(&sid) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.clear_busy(sid.as_str());
+                return self.writer.send(&GatewayFailure::new(id, 4040, error.to_string()));
+            }
+        };
+        let generation = snapshot.owner_generation;
+        let spec = ForegroundTurnSpec {
+            turn_id: turn_id.clone(),
+            session_id: sid.clone(),
+            prompt: text.clone(),
+        };
+        let claim = match SqliteForegroundTurnStore::open(&self.state)
+            .and_then(|mut turns| turns.start(spec, generation, started_at_ms))
+        {
+            Ok(claim) => claim,
+            Err(error) => {
+                self.clear_busy(sid.as_str());
+                let error = foreground_rpc_error(error);
+                return self.writer.send(&GatewayFailure::new(id, error.code, error.message));
+            }
+        };
 
         let (cancel_sender, cancel_receiver) = oneshot::channel();
-        self.controls
-            .lock()
-            .map_err(|_| anyhow::anyhow!("turn-control lock poisoned"))?
-            .insert(sid.as_str().to_owned(), cancel_sender);
+        if let Ok(mut controls) = self.controls.lock() {
+            controls.insert(sid.as_str().to_owned(), cancel_sender);
+        } else {
+            self.clear_turn(sid.as_str());
+            let _ = terminate_turn(
+                &self.state,
+                &claim.spec.turn_id,
+                claim.owner_generation,
+                ForegroundTurnTerminal::Failed { reason: "turn-control lock poisoned".into() },
+                claim.started_at_ms,
+            );
+            anyhow::bail!("turn-control lock poisoned");
+        }
         if let Err(error) =
             self.writer.send(&GatewaySuccess::new(id, json!({"status": "streaming"})))
         {
             self.clear_turn(sid.as_str());
+            let _ = terminate_turn(
+                &self.state,
+                &claim.spec.turn_id,
+                claim.owner_generation,
+                ForegroundTurnTerminal::Failed {
+                    reason: "gateway could not acknowledge the accepted turn".into(),
+                },
+                claim.started_at_ms,
+            );
             return Err(error);
         }
         let settings = self.settings.clone();
@@ -326,8 +435,31 @@ impl GatewayHost {
         self.turns.push(tokio::spawn(async move {
             writer.event("message.start", &sid, None);
             let result = tokio::select! {
-                result = run_session_turn(&settings, &state, &writer, &sid, &text) => Some(result),
+                result = run_session_turn(&settings, &state, &writer, &claim) => Some(result),
                 _ = cancel_receiver => None,
+            };
+            let result = match result {
+                Some(Ok(final_response)) => Ok(TurnExit::Completed(final_response)),
+                Some(Err(error)) => terminate_turn(
+                    &state,
+                    &claim.spec.turn_id,
+                    claim.owner_generation,
+                    ForegroundTurnTerminal::Failed {
+                        reason: normalized_reason(&error.to_string(), "foreground turn failed"),
+                    },
+                    claim.started_at_ms,
+                )
+                .map(|_| TurnExit::Failed(format!("Error: {error}"))),
+                None => terminate_turn(
+                    &state,
+                    &claim.spec.turn_id,
+                    claim.owner_generation,
+                    ForegroundTurnTerminal::Interrupted {
+                        reason: "client requested foreground interruption".into(),
+                    },
+                    claim.started_at_ms,
+                )
+                .map(|_| TurnExit::Interrupted),
             };
             if let Ok(mut active) = busy.lock() {
                 active.remove(sid.as_str());
@@ -336,18 +468,26 @@ impl GatewayHost {
                 active.remove(sid.as_str());
             }
             match result {
-                Some(Ok(final_response)) => {
+                Ok(TurnExit::Completed(final_response)) => {
                     writer.event("message.complete", &sid, Some(json!({"text": final_response})))
                 }
-                Some(Err(error)) => writer.event(
+                Ok(TurnExit::Failed(error)) => writer.event(
                     "message.complete",
                     &sid,
-                    Some(json!({"text": format!("Error: {error}"), "status": "error"})),
+                    Some(json!({"text": error, "status": "error"})),
                 ),
-                None => writer.event(
+                Ok(TurnExit::Interrupted) => writer.event(
                     "message.complete",
                     &sid,
                     Some(json!({"status": "interrupted", "text": ""})),
+                ),
+                Err(error) => writer.event(
+                    "message.complete",
+                    &sid,
+                    Some(json!({
+                        "text": format!("Error: foreground terminal was not persisted: {error}"),
+                        "status": "error",
+                    })),
                 ),
             }
             writer.event("session.info", &sid, Some(session_info(&settings)));
@@ -381,11 +521,19 @@ async fn run_session_turn(
     settings: &LiveSettings,
     state: &Path,
     writer: &FrameWriter,
-    session_id: &SessionId,
-    prompt: &str,
+    claim: &ForegroundTurnSnapshot,
 ) -> anyhow::Result<String> {
+    let session_id = &claim.spec.session_id;
+    let expected_generation = claim.owner_generation;
     let mut store = SqliteSessionStore::open(state)?;
     let snapshot = store.load(session_id)?;
+    if snapshot.owner_generation != expected_generation {
+        anyhow::bail!(
+            "session generation changed before turn execution: expected {}, actual {}",
+            expected_generation.get(),
+            snapshot.owner_generation.get()
+        );
+    }
     let previous_len = snapshot.conversation.len();
     let scope = format!(
         "session:{}:generation:{}",
@@ -396,7 +544,7 @@ async fn run_session_turn(
     let outcome = execute_turn_observed(
         settings,
         snapshot.conversation,
-        prompt,
+        &claim.spec.prompt,
         &scope,
         state,
         &mut observer,
@@ -406,8 +554,29 @@ async fn run_session_turn(
     let appended = outcome.semantic_conversation.get(previous_len..).ok_or_else(|| {
         anyhow::anyhow!("runtime returned a conversation shorter than its durable prefix")
     })?;
-    store.append(session_id, snapshot.owner_generation, appended)?;
+    SqliteForegroundTurnStore::open(state)?.complete(
+        &claim.spec.turn_id,
+        expected_generation,
+        appended,
+        terminal_time_ms(claim.started_at_ms),
+    )?;
     Ok(final_response)
+}
+
+fn terminate_turn(
+    state: &Path,
+    turn_id: &ForegroundTurnId,
+    expected_generation: OwnerGeneration,
+    outcome: ForegroundTurnTerminal,
+    started_at_ms: u64,
+) -> anyhow::Result<()> {
+    SqliteForegroundTurnStore::open(state)?.terminate(
+        turn_id,
+        expected_generation,
+        outcome,
+        terminal_time_ms(started_at_ms),
+    )?;
+    Ok(())
 }
 
 fn session_info(settings: &LiveSettings) -> Value {
@@ -494,6 +663,65 @@ fn transcript(messages: &[SemanticMessage]) -> Vec<Value> {
         .collect()
 }
 
+struct ResumeProjection {
+    messages: Vec<Value>,
+    inflight: Value,
+    recovery: Value,
+}
+
+fn resume_projection(
+    conversation: &[SemanticMessage],
+    latest: Option<&ForegroundTurnSnapshot>,
+    busy: bool,
+) -> ResumeProjection {
+    let mut messages = transcript(conversation);
+    let mut inflight = Value::Null;
+    let mut recovery = Value::Null;
+    let Some(turn) = latest else {
+        return ResumeProjection { messages, inflight, recovery };
+    };
+    match &turn.state {
+        ForegroundTurnState::Running => {
+            inflight = json!({
+                "user": turn.spec.prompt,
+                "assistant": "",
+                "streaming": busy,
+            });
+        }
+        ForegroundTurnState::Terminal { outcome: ForegroundTurnTerminal::Completed, .. } => {}
+        ForegroundTurnState::Terminal { outcome, completed_at_ms } => {
+            let (reason, note) = match outcome {
+                ForegroundTurnTerminal::Interrupted { reason } => (
+                    reason.as_str(),
+                    "Foreground turn interrupted; it was not committed or replayed.",
+                ),
+                ForegroundTurnTerminal::Failed { reason } => {
+                    (reason.as_str(), "Foreground turn failed before commit; it was not replayed.")
+                }
+                ForegroundTurnTerminal::OutcomeUnknown { reason } => (
+                    reason.as_str(),
+                    "Foreground turn outcome is unknown after restart; it was not replayed.",
+                ),
+                ForegroundTurnTerminal::Completed => {
+                    return ResumeProjection { messages, inflight, recovery };
+                }
+            };
+            messages.push(json!({"role": "user", "text": turn.spec.prompt}));
+            messages.push(json!({"role": "system", "text": note}));
+            recovery = json!({
+                "auto_replayed": false,
+                "completed_at_ms": completed_at_ms,
+                "prompt": turn.spec.prompt,
+                "reason": reason,
+                "started_at_ms": turn.started_at_ms,
+                "status": outcome.status_name(),
+                "turn_id": turn.spec.turn_id,
+            });
+        }
+    }
+    ResumeProjection { messages, inflight, recovery }
+}
+
 fn config_value(params: &Map<String, Value>) -> Value {
     match params.get("key").and_then(Value::as_str).unwrap_or("full") {
         "full" => json!({
@@ -532,6 +760,45 @@ fn fresh_session_id() -> anyhow::Result<SessionId> {
         .context("system clock precedes Unix epoch")?
         .as_nanos();
     SessionId::new(format!("rs-{}-{now:x}", std::process::id())).map_err(Into::into)
+}
+
+fn fresh_turn_id() -> anyhow::Result<ForegroundTurnId> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_nanos();
+    ForegroundTurnId::new(format!("turn-{}-{now:x}", std::process::id())).map_err(Into::into)
+}
+
+fn unix_time_ms() -> anyhow::Result<u64> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock precedes Unix epoch")?
+        .as_millis();
+    u64::try_from(millis).context("Unix timestamp exceeds u64 milliseconds")
+}
+
+fn terminal_time_ms(started_at_ms: u64) -> u64 {
+    unix_time_ms().unwrap_or(started_at_ms).max(started_at_ms)
+}
+
+fn normalized_reason(message: &str, fallback: &str) -> String {
+    let message = message.trim();
+    if message.is_empty() { fallback.into() } else { message.into() }
+}
+
+fn foreground_rpc_error(error: ForegroundTurnStoreError) -> RpcError {
+    match error {
+        ForegroundTurnStoreError::SessionBusy(_) => RpcError::new(4090, error.to_string()),
+        ForegroundTurnStoreError::SessionNotFound(_) => RpcError::new(4040, error.to_string()),
+        ForegroundTurnStoreError::GenerationConflict { .. }
+        | ForegroundTurnStoreError::AlreadyExists(_)
+        | ForegroundTurnStoreError::NotRunning { .. } => RpcError::new(4093, error.to_string()),
+        ForegroundTurnStoreError::Invalid(_) => RpcError::new(4002, error.to_string()),
+        ForegroundTurnStoreError::NotFound(_) | ForegroundTurnStoreError::Storage(_) => {
+            internal_error(error)
+        }
+    }
 }
 
 fn internal_error(error: impl std::fmt::Display) -> RpcError {
@@ -579,5 +846,24 @@ impl FrameWriter {
         payload: Option<Value>,
     ) -> anyhow::Result<()> {
         self.send(&GatewayEventFrame::session(kind, session_id.as_str(), payload))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::GatewayLease;
+
+    #[test]
+    fn gateway_lease_rejects_a_second_writer_and_releases_on_drop()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let state = directory.path().join("state.db");
+        let first = GatewayLease::acquire(&state)?;
+        assert!(GatewayLease::acquire(&state).is_err());
+        drop(first);
+        let _replacement = GatewayLease::acquire(&state)?;
+        Ok(())
     }
 }

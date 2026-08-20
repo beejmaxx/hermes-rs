@@ -22,6 +22,9 @@
   pre-terminal delivery proof
 - Cooperative foreground interruption with cleanup-before-terminal ordering
   and durable preservation of any unresolved tool-effect plan
+- Generation-guarded foreground claims, atomic session/turn completion, and a
+  real process-death restart proof that reconciles to `outcome_unknown` without
+  replay
 
 ## Current package decisions
 
@@ -45,7 +48,7 @@
 - Reconciliation policy for effects left pending by a crash
 - Long-lived child execution and legal new-turn delivery over the durable
   delegation state machine
-- Cancellation, steering, and explicitly replay-safe restart policy
+- Steering and an explicitly proven replay-safe restart policy
 - Branching a new lineage when a user intentionally changes model or manifest
 - A polished `hermes --tui` launcher/config path for Rust (the companion Ink
   fork now has a direct developer process-selection seam)

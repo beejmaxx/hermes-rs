@@ -7,8 +7,9 @@ use std::{
     time::Duration,
 };
 
-use hermesd::adapters::{AgentTools, SqliteSessionStore};
-use ports::SessionStore;
+use domain::{ForegroundTurnState, ForegroundTurnTerminal};
+use hermesd::adapters::{AgentTools, SqliteForegroundTurnStore, SqliteSessionStore};
+use ports::{ForegroundTurnStore, SessionStore};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
@@ -207,9 +208,129 @@ async fn stdio_client_can_interrupt_a_turn_without_leaving_the_session_busy()
     let resumed = gateway.read_response("resume")?;
     assert_eq!(resumed["result"]["running"], false);
     assert_eq!(resumed["result"]["message_count"], 0);
-    assert_eq!(resumed["result"]["messages"], json!([]));
+    assert_eq!(
+        resumed["result"]["messages"],
+        json!([
+            {"role": "user", "text": "cancel this turn"},
+            {
+                "role": "system",
+                "text": "Foreground turn interrupted; it was not committed or replayed."
+            }
+        ])
+    );
+    assert_eq!(resumed["result"]["recovery"]["status"], "interrupted");
+    assert_eq!(resumed["result"]["recovery"]["auto_replayed"], false);
 
     gateway.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn process_death_is_reconciled_without_replaying_the_prompt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = tempdir()?;
+    let workspace = tempdir()?;
+    let root = fs::canonicalize(workspace.path())?;
+    let database = state_dir.path().join("state.db");
+    let server = MockServer::start().await;
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .respond_with(
+            streaming_text("This response must never commit.").set_delay(Duration::from_secs(10)),
+        )
+        .mount(&server)
+        .await;
+
+    let base_url = format!("{}/v1", server.uri());
+    let arguments = [
+        "--state",
+        path_text(&database)?,
+        "gateway",
+        "--provider",
+        "custom",
+        "--base-url",
+        &base_url,
+        "--model",
+        "test-model",
+        "--root",
+        path_text(&root)?,
+    ];
+    let mut gateway = GatewayProcess::spawn(&arguments)?;
+    let ready = gateway.read_frame()?;
+    assert_eq!(ready["params"]["payload"]["reconciled_foreground_turns"], 0);
+    let mut contender = GatewayProcess::spawn(&arguments)?;
+    assert!(contender.read_frame().is_err(), "a second gateway acquired the live state database");
+    drop(contender);
+
+    gateway.request("create", "session.create", json!({}))?;
+    let created = gateway.read_response("create")?;
+    let session_id = created["result"]["session_id"]
+        .as_str()
+        .ok_or("session.create omitted session_id")?
+        .to_owned();
+    gateway.request(
+        "prompt",
+        "prompt.submit",
+        json!({"session_id": session_id, "text": "survive this crash"}),
+    )?;
+    assert_eq!(gateway.read_response("prompt")?["result"]["status"], "streaming");
+    assert_eq!(gateway.read_frame()?["params"]["type"], "message.start");
+
+    let mut provider_started = false;
+    for _ in 0..100 {
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or("request recording is disabled on the mock server")?;
+        if !requests.is_empty() {
+            provider_started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(provider_started, "provider request did not start before the crash");
+    gateway.request("live-resume", "session.resume", json!({"session_id": session_id}))?;
+    let live = gateway.read_response("live-resume")?;
+    assert_eq!(live["result"]["running"], true);
+    assert_eq!(live["result"]["messages"], json!([]));
+    assert_eq!(live["result"]["inflight"]["user"], "survive this crash");
+    assert_eq!(live["result"]["inflight"]["streaming"], true);
+    gateway.kill()?;
+
+    let mut recovered = GatewayProcess::spawn(&arguments)?;
+    let ready = recovered.read_frame()?;
+    assert_eq!(ready["params"]["payload"]["reconciled_foreground_turns"], 1);
+    recovered.request("resume", "session.resume", json!({"session_id": session_id}))?;
+    let resumed = recovered.read_response("resume")?;
+    assert_eq!(resumed["result"]["running"], false);
+    assert_eq!(resumed["result"]["message_count"], 0);
+    assert_eq!(
+        resumed["result"]["messages"],
+        json!([
+            {"role": "user", "text": "survive this crash"},
+            {
+                "role": "system",
+                "text": "Foreground turn outcome is unknown after restart; it was not replayed."
+            }
+        ])
+    );
+    assert_eq!(resumed["result"]["recovery"]["status"], "outcome_unknown");
+    assert_eq!(resumed["result"]["recovery"]["prompt"], "survive this crash");
+    assert_eq!(resumed["result"]["recovery"]["auto_replayed"], false);
+    recovered.shutdown()?;
+
+    let mut turns = SqliteForegroundTurnStore::open(&database)?;
+    let latest = turns
+        .latest(&domain::SessionId::new(&session_id)?)?
+        .ok_or("reconciled foreground turn is missing")?;
+    assert!(matches!(
+        latest.state,
+        ForegroundTurnState::Terminal {
+            outcome: ForegroundTurnTerminal::OutcomeUnknown { .. },
+            ..
+        }
+    ));
     Ok(())
 }
 
@@ -271,6 +392,13 @@ impl GatewayProcess {
         drop(self.input.take());
         let status = self.child.wait()?;
         if status.success() { Ok(()) } else { Err(format!("gateway exited with {status}").into()) }
+    }
+
+    fn kill(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        drop(self.input.take());
+        self.child.kill()?;
+        let _status = self.child.wait()?;
+        Ok(())
     }
 }
 
