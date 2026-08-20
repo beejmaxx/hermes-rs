@@ -1,13 +1,10 @@
 [workspace]
 members = [
-    "apps/hermes",
+    "apps/hermesd",
     "crates/domain",
-    "crates/local-tools",
     "crates/ports",
     "crates/protocol",
-    "crates/providers",
     "crates/runtime",
-    "crates/testkit",
 ]
 resolver = "3"
 
@@ -22,6 +19,7 @@ authors = ["Hermes contributors"]
 anyhow = "1"
 async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
+dirs = "6"
 eventsource-stream = "0.2"
 futures-core = "0.3"
 futures-executor = "0.3"
@@ -30,6 +28,7 @@ globset = "0.4"
 ignore = "0.4"
 regex = "1"
 reqwest = { version = "0.13", features = ["json", "stream"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

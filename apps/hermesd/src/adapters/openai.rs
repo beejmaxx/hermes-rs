@@ -41,6 +41,11 @@ pub struct OpenAiCompatibleProvider {
 }
 
 impl OpenAiCompatibleProvider {
+    /// Validate and normalize a base URL without constructing a client or sending a request.
+    pub fn validate_base_url(base_url: &str) -> Result<(), OpenAiProviderConfigError> {
+        chat_completions_endpoint(base_url).map(drop)
+    }
+
     /// Create a provider using the default HTTP client and timeout.
     pub fn new(base_url: &str, api_key: Option<String>) -> Result<Self, OpenAiProviderConfigError> {
         let client = Client::builder()
@@ -354,7 +359,21 @@ mod tests {
     use serde_json::json;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
 
-    use super::OpenAiCompatibleProvider;
+    use super::{OpenAiCompatibleProvider, OpenAiProviderConfigError};
+
+    #[test]
+    fn validates_endpoint_security_before_requests() {
+        assert!(OpenAiCompatibleProvider::validate_base_url("https://example.com/v1").is_ok());
+        assert!(OpenAiCompatibleProvider::validate_base_url("http://127.0.0.1:11434/v1").is_ok());
+        assert!(matches!(
+            OpenAiCompatibleProvider::validate_base_url("http://example.com/v1"),
+            Err(OpenAiProviderConfigError::InsecureUrl)
+        ));
+        assert!(matches!(
+            OpenAiCompatibleProvider::validate_base_url("https://user:secret@example.com/v1"),
+            Err(OpenAiProviderConfigError::EmbeddedCredentials)
+        ));
+    }
 
     #[tokio::test]
     async fn streams_text_usage_and_a_terminal() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,56 +1,38 @@
-# Foundation review checkpoint
+# Implementation checkpoints
 
-This checkpoint is resolved for the first offline runtime milestone. The
-decisions below keep the foundation narrow while allowing behavior work to
-begin.
+## Completed
 
-## Included
+- A pinned, checksummed Python-oracle corpus and typed Rust reader
+- A provider-neutral agent loop that reproduces every captured agent-turn
+  outcome
+- OpenAI-compatible streaming, root-confined read-only tools, and an end-to-end
+  live-edge test
+- Immutable session manifests and semantic conversation projection
+- SQLite sessions with owner-generation compare-and-swap
+- A write-ahead tool-effect ledger with duplicate-dispatch protection
+- Multi-process CLI session resume against the real runtime
 
-- Workspace and dependency direction
-- Opaque profile/session/lineage/run/task/worker/board/event/tool-call IDs
-- Nonzero owner-generation and fence-token types
-- Provider-neutral semantic messages and conversation-order validation
-- Tool result dispositions including `outcome_unknown`
-- Immutable engine, system-prompt digest, and ordered-tool-catalog digest
-- Provisional durable task states, transition validation, and worker leases
-- Typed v1 contract headers/outcomes and an exact-byte bundle reader
-- Offline CLI shell for contract verification
+## Current package decisions
 
-## Deliberately not included
+1. `domain`, `protocol`, `ports`, and `runtime` are genuine reusable kernel
+   boundaries.
+2. Provider, local-tool, SQLite, CLI, and contract-support implementations are
+   modules in `hermesd`, not one crate per directory.
+3. Create another crate only for a demonstrated second consumer,
+   optional-dependency boundary, separately deployed executable, or independent
+   distribution requirement.
+4. Keep provider replay data on semantic messages until a concrete store or
+   transport constraint requires a sidecar.
+5. Persist only complete replayable turns; failures never leave an unresolved
+   assistant tool request in session history.
+6. Keep task and lease types provisional until coordination is the active
+   milestone.
 
-- Vendored Python-oracle fixtures
-- Agent loop or scripted provider/tool execution
-- Provider, tool, database, gateway, plugin, or process implementations
-- Async runtime selection
-- SQLite schema
-- Public JSON-RPC API
-- Migration or coexistence code
+## Deferred
 
-## Decisions
-
-1. Keep `domain`, `protocol`, `ports`, and `testkit`; the offline runtime is the
-   first concrete consumer that will populate `ports`.
-2. Keep opaque provider replay data attached to semantic messages until a real
-   store proves a sidecar is necessary.
-3. Keep `Conversation` as the replayable view and emit in-flight execution
-   ledger operations separately as persistence intents.
-4. A user-tail conversation is valid after cancellation or failure; an
-   unresolved assistant tool request is never replayable.
-5. Task and lease types remain provisional and receive no further work before
-   the single-agent runtime is usable.
-6. Database-clock lease expiry is provisional until the store becomes a real
-   consumer.
-7. Add opaque identifiers only when a concrete invariant requires them; do not
-   wrap every string preemptively.
-8. `serde_json::Value` remains limited to tool arguments, provider replay, and
-   recorded protocol/test payloads.
-9. Keep `ports`, but define only the provider and tool traits consumed by the
-   offline runtime.
-10. Keep terse private package names; diagnostics and dependency declarations
-    are clear within this workspace.
-
-## Review gate
-
-The written dispositions above open the gate for pinned fixtures, scripted
-adapters, and the offline agent kernel. Live providers, real effects, storage,
-gateway work, and coordination remain outside this checkpoint.
+- Reconciliation policy and CLI visibility for effects left pending by a crash
+- Branching a new lineage when a user intentionally changes model or manifest
+- Public gateway/JSON-RPC integration with existing Hermes clients
+- Task claims, leases, fencing, inbox/outbox delivery, and coordinator recovery
+- Reading, writing, or migrating an existing Python Hermes database
+- A native plugin ABI

@@ -11,7 +11,10 @@ use domain::{
     ToolCall, ToolCallId, ToolResult, ToolResultStatus, ToolTerminal,
 };
 use futures_util::StreamExt;
-use ports::{AttemptErrorPolicy, Provider, ProviderError, ToolBroker, ToolBrokerError};
+use futures_util::{FutureExt, future::BoxFuture};
+use ports::{
+    AttemptErrorPolicy, EffectLedger, Provider, ProviderError, ToolBroker, ToolBrokerError,
+};
 use protocol::{
     AgentTurnRequest, ChatCompletionsRequest, ContractOutcome, ProviderEvent, ProviderFunctionCall,
     ProviderMessage, ProviderRequestRecord, ProviderToolCall, TerminalOutcome, TerminalStatus,
@@ -21,6 +24,61 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 
 const MAX_ATTEMPTS_PER_TURN: usize = 128;
+
+/// Tool broker decorator that durably journals plans before dispatch and terminals after.
+pub struct JournaledToolBroker<B, L> {
+    inner: B,
+    ledger: L,
+    execution_scope: String,
+}
+
+impl<B, L> JournaledToolBroker<B, L> {
+    /// Wrap a tool broker with a durable ledger for one stable execution scope.
+    pub fn new(
+        inner: B,
+        ledger: L,
+        execution_scope: impl Into<String>,
+    ) -> Result<Self, ToolBrokerError> {
+        let execution_scope = execution_scope.into();
+        if execution_scope.is_empty() {
+            return Err(ToolBrokerError::new("journal execution scope must be non-empty"));
+        }
+        Ok(Self { inner, ledger, execution_scope })
+    }
+
+    /// Consume the decorator and return its broker and ledger.
+    pub fn into_parts(self) -> (B, L) {
+        (self.inner, self.ledger)
+    }
+}
+
+impl<B, L> ToolBroker for JournaledToolBroker<B, L>
+where
+    B: ToolBroker,
+    L: EffectLedger,
+{
+    fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
+        let plans = self.inner.plan(calls)?;
+        self.ledger
+            .record_plans(&self.execution_scope, &plans)
+            .map_err(|error| ToolBrokerError::new(error.to_string()))?;
+        Ok(plans)
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        calls: &'a [PlannedToolCall],
+    ) -> BoxFuture<'a, Result<Vec<ToolTerminal>, ToolBrokerError>> {
+        async move {
+            let terminals = self.inner.execute(calls).await?;
+            self.ledger
+                .record_terminals(&terminals)
+                .map_err(|error| ToolBrokerError::new(error.to_string()))?;
+            Ok(terminals)
+        }
+        .boxed()
+    }
+}
 
 /// An offline turn could not produce a valid contract outcome.
 #[derive(Debug, Error)]
@@ -427,6 +485,59 @@ where
     })
 }
 
+/// Project a validated semantic conversation back into Chat Completions messages.
+pub fn project_conversation(
+    messages: &[SemanticMessage],
+) -> Result<Vec<ProviderMessage>, RuntimeError> {
+    Conversation::new(messages.to_vec())?;
+    let mut projected = Vec::new();
+    for message in messages {
+        match message {
+            SemanticMessage::User { content } => {
+                projected.push(ProviderMessage::User { content: content.clone() });
+            }
+            SemanticMessage::Assistant { content, reasoning, provider_replay } => {
+                projected.push(ProviderMessage::Assistant {
+                    content: Some(content.clone()),
+                    reasoning: reasoning.clone(),
+                    tool_calls: Vec::new(),
+                    provider_replay: provider_replay.clone(),
+                });
+            }
+            SemanticMessage::AssistantToolRequest {
+                content,
+                calls,
+                reasoning,
+                provider_replay,
+            } => {
+                projected.push(provider_tool_request(
+                    content.as_deref().unwrap_or_default(),
+                    reasoning.as_deref().unwrap_or_default(),
+                    calls,
+                    provider_replay.clone(),
+                )?);
+            }
+            SemanticMessage::ToolResultBatch { results } => {
+                for result in results {
+                    let execution_key = result.execution_key.clone().ok_or_else(|| {
+                        RuntimeError::InvalidTurn(format!(
+                            "persisted tool result {} has no execution key",
+                            result.call_id
+                        ))
+                    })?;
+                    projected.push(ProviderMessage::Tool {
+                        tool_call_id: result.call_id.as_str().into(),
+                        status: status_name(result.status).into(),
+                        content: result.content.clone(),
+                        execution_key,
+                    });
+                }
+            }
+        }
+    }
+    Ok(projected)
+}
+
 fn validate_request(request: &AgentTurnRequest) -> Result<(), RuntimeError> {
     if request.transport != TransportKind::ChatCompletions {
         return Err(RuntimeError::InvalidTurn(
@@ -698,5 +809,51 @@ fn parse_status(value: &str) -> Result<ToolResultStatus, RuntimeError> {
         "outcome_unknown" => Ok(ToolResultStatus::OutcomeUnknown),
         "observed" => Ok(ToolResultStatus::Observed),
         other => Err(RuntimeError::InvalidTurn(format!("unknown tool terminal status {other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use domain::{
+        SemanticMessage, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolResultStatus,
+    };
+    use serde_json::json;
+
+    use super::{project_conversation, semanticize};
+
+    #[test]
+    fn semantic_projection_round_trips_a_tool_turn() -> Result<(), Box<dyn std::error::Error>> {
+        let call_id = ToolCallId::new("call-read")?;
+        let messages = vec![
+            SemanticMessage::User { content: "read it".into() },
+            SemanticMessage::AssistantToolRequest {
+                content: None,
+                calls: vec![ToolCall {
+                    id: call_id.clone(),
+                    name: "read_file".into(),
+                    arguments: ToolArguments(BTreeMap::from([("path".into(), json!("README.md"))])),
+                }],
+                reasoning: None,
+                provider_replay: None,
+            },
+            SemanticMessage::ToolResultBatch {
+                results: vec![ToolResult {
+                    call_id,
+                    status: ToolResultStatus::Succeeded,
+                    content: "1|hello\n".into(),
+                    execution_key: Some("session:call-read".into()),
+                }],
+            },
+            SemanticMessage::Assistant {
+                content: "It says hello.".into(),
+                reasoning: None,
+                provider_replay: None,
+            },
+        ];
+        let projected = project_conversation(&messages)?;
+        assert_eq!(semanticize(&projected)?, messages);
+        Ok(())
     }
 }

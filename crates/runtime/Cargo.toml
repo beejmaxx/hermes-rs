@@ -16,9 +16,5 @@ protocol = { path = "../protocol" }
 serde_json.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-futures-executor.workspace = true
-testkit = { path = "../testkit" }
-
 [lints]
 workspace = true

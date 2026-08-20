@@ -3,7 +3,7 @@
 //! Dynamic JSON is permitted here only where a provider-specific or recorded
 //! test payload is intentionally opaque to the domain.
 
-use domain::SemanticMessage;
+use domain::{LineageId, OwnerGeneration, PromptManifest, SemanticMessage, SessionId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -146,6 +146,72 @@ pub struct AgentTurnRequest {
     pub conversation: Vec<ProviderMessage>,
     /// Ordered frozen tool schemas.
     pub tools: Vec<Value>,
+}
+
+/// Immutable configuration captured when a durable session is created.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Stable user-facing session identity.
+    pub session_id: SessionId,
+    /// Immutable lineage identity; equal to the session ID until explicit branching exists.
+    pub lineage_id: LineageId,
+    /// Frozen engine and prompt/tool byte identity.
+    pub prompt_manifest: PromptManifest,
+    /// Provider transport used for every turn in this lineage.
+    pub transport: TransportKind,
+    /// Stable provider-adapter name such as `openai` or `openrouter`.
+    pub provider_adapter: String,
+    /// Non-secret OpenAI-compatible API base URL.
+    pub base_url: String,
+    /// Name of the environment variable containing the credential, when required.
+    pub api_key_env: Option<String>,
+    /// Immutable provider model identifier.
+    pub model: String,
+    /// Canonical filesystem root visible to session tools.
+    pub tool_root: String,
+    /// Exact frozen system-prompt bytes.
+    pub system_prompt: String,
+    /// Exact ordered frozen tool catalog.
+    pub tools: Vec<Value>,
+}
+
+/// One fully loaded durable session.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSnapshot {
+    /// Immutable configuration.
+    pub config: SessionConfig,
+    /// Current optimistic write-authority generation.
+    pub owner_generation: OwnerGeneration,
+    /// Validated provider-neutral conversation.
+    pub conversation: Vec<SemanticMessage>,
+}
+
+/// Compact durable-session listing record.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSummary {
+    /// Stable session identity.
+    pub session_id: SessionId,
+    /// Provider adapter frozen for the session.
+    pub provider_adapter: String,
+    /// Provider model frozen for the session.
+    pub model: String,
+    /// Current optimistic write-authority generation.
+    pub owner_generation: OwnerGeneration,
+    /// Number of persisted semantic messages.
+    pub message_count: usize,
+}
+
+/// A durably planned tool invocation that has no terminal disposition yet.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PendingEffect {
+    /// Stable execution scope in which the invocation was planned.
+    pub execution_scope: String,
+    /// Complete frozen invocation plan.
+    pub plan: domain::PlannedToolCall,
 }
 
 /// A normalized event emitted by a model-provider transport.

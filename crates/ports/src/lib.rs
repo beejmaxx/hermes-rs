@@ -2,10 +2,15 @@
 
 use std::pin::Pin;
 
-use domain::{PlannedToolCall, ToolCall, ToolTerminal};
+use domain::{
+    OwnerGeneration, PlannedToolCall, SemanticMessage, SessionId, ToolCall, ToolTerminal,
+};
 use futures_core::Stream;
 use futures_util::future::BoxFuture;
-use protocol::{ChatCompletionsRequest, ProviderEvent};
+use protocol::{
+    ChatCompletionsRequest, PendingEffect, ProviderEvent, SessionConfig, SessionSnapshot,
+    SessionSummary,
+};
 use thiserror::Error;
 
 /// Provider attempt failure policy selected before the attempt begins.
@@ -82,4 +87,90 @@ pub trait ToolBroker: Send {
         &'a mut self,
         calls: &'a [PlannedToolCall],
     ) -> BoxFuture<'a, Result<Vec<ToolTerminal>, ToolBrokerError>>;
+}
+
+/// A durable session operation failed without exposing backend-specific errors.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum SessionStoreError {
+    /// A create operation targeted an existing session.
+    #[error("session already exists: {0}")]
+    AlreadyExists(SessionId),
+    /// A requested session did not exist.
+    #[error("session not found: {0}")]
+    NotFound(SessionId),
+    /// Another writer advanced the authority generation first.
+    #[error("session {session_id} write conflict: expected generation {expected}, actual {actual}")]
+    Conflict {
+        /// Conflicting session.
+        session_id: SessionId,
+        /// Generation supplied by the caller.
+        expected: u64,
+        /// Current durable generation.
+        actual: u64,
+    },
+    /// Input or stored session state violated an invariant.
+    #[error("invalid session state: {0}")]
+    Invalid(String),
+    /// The storage backend failed.
+    #[error("session storage failed: {0}")]
+    Storage(String),
+}
+
+/// Single-writer durable session repository owned by the kernel boundary.
+pub trait SessionStore: Send {
+    /// Create an empty session at owner generation one.
+    fn create(&mut self, config: SessionConfig) -> Result<SessionSnapshot, SessionStoreError>;
+
+    /// Load one complete session and validate its conversation.
+    fn load(&mut self, session_id: &SessionId) -> Result<SessionSnapshot, SessionStoreError>;
+
+    /// Append one complete turn under an optimistic generation guard.
+    fn append(
+        &mut self,
+        session_id: &SessionId,
+        expected_generation: OwnerGeneration,
+        messages: &[SemanticMessage],
+    ) -> Result<SessionSnapshot, SessionStoreError>;
+
+    /// List compact session records, newest first.
+    fn list(&mut self) -> Result<Vec<SessionSummary>, SessionStoreError>;
+}
+
+/// Durable effect-ledger operation failed.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum EffectLedgerError {
+    /// An execution key already has a durable plan or terminal.
+    #[error("effect execution key is already recorded: {0}")]
+    AlreadyRecorded(String),
+    /// A terminal was supplied without a matching durable plan.
+    #[error("effect execution key has no durable plan: {0}")]
+    MissingPlan(String),
+    /// A terminal disagreed with its frozen durable plan.
+    #[error("effect terminal does not match its durable plan: {0}")]
+    PlanMismatch(String),
+    /// A recorded invocation already has a terminal disposition.
+    #[error("effect execution key already has a terminal disposition: {0}")]
+    AlreadyTerminal(String),
+    /// Input or stored ledger state violated an invariant.
+    #[error("invalid effect ledger state: {0}")]
+    Invalid(String),
+    /// The ledger backend failed.
+    #[error("effect ledger storage failed: {0}")]
+    Storage(String),
+}
+
+/// Durable write-ahead ledger for every dispatched tool effect.
+pub trait EffectLedger: Send {
+    /// Atomically record complete plans before any invocation is dispatched.
+    fn record_plans(
+        &mut self,
+        execution_scope: &str,
+        plans: &[PlannedToolCall],
+    ) -> Result<(), EffectLedgerError>;
+
+    /// Atomically attach exactly one terminal disposition to every completed plan.
+    fn record_terminals(&mut self, terminals: &[ToolTerminal]) -> Result<(), EffectLedgerError>;
+
+    /// List plans left without a terminal disposition after interruption or crash.
+    fn pending(&mut self) -> Result<Vec<PendingEffect>, EffectLedgerError>;
 }

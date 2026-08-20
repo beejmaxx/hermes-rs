@@ -33,10 +33,13 @@ cannot mutate authoritative state directly.
 - `protocol`: versioned serializable boundary types
 - `ports`: traits owned by the kernel rather than adapters
 - `runtime`: provider-neutral agent loop over provider and tool ports
-- `providers`: live OpenAI-compatible HTTP/SSE adapter
-- `local-tools`: root-confined `read_file` and `search_files` broker
-- `testkit`: readers and helpers for the shared contract corpus
-- `apps/hermes`: contract and live single-turn developer CLI
+- `hermesd`: executable, CLI, SQLite state, contract support, and concrete
+  OpenAI-compatible and root-confined tool adapters
+
+Crates are created only for real dependency boundaries. Concrete adapters stay
+as modules in `hermesd` until another executable, an optional dependency, or an
+independently distributed component needs them. Subsystem names alone are not
+a reason to create a package.
 
 ## Development
 
@@ -44,7 +47,7 @@ cannot mutate authoritative state directly.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo run -p hermes-cli -- contract check contracts/hermes-v1
+cargo run -p hermesd -- contract check contracts/hermes-v1
 ```
 
 ## Try a live turn
@@ -57,7 +60,7 @@ read-only and confined to `--root`; common credential paths such as `.env`,
 
 ```bash
 export OPENROUTER_API_KEY="..."
-cargo run -p hermes-cli -- chat \
+cargo run -p hermesd -- chat \
   --provider openrouter \
   --model your-model-id \
   --root . \
@@ -67,15 +70,28 @@ cargo run -p hermes-cli -- chat \
 For a local server that needs no credential:
 
 ```bash
-cargo run -p hermes-cli -- chat \
+cargo run -p hermesd -- chat \
   --provider custom \
   --base-url http://127.0.0.1:11434/v1 \
   --model your-model \
   "Say hello."
 ```
 
-The first go/no-go proof remains a bounded, deterministic single-agent turn.
-The Rust runtime executes every pinned `agent_turn` fixture and reproduces its
-provider requests, semantic conversation, persistence intents, public events,
-usage, and terminal outcome. The live edge now exercises that same runtime;
-durable sessions and coordination come next.
+Add `--session NAME` to create a durable lineage or resume it in a later
+process. Its provider, model, prompt, tool catalog, and root are immutable:
+
+```bash
+cargo run -p hermesd -- chat --session demo \
+  --provider openrouter --model your-model-id --root . \
+  "Inspect this repository."
+cargo run -p hermesd -- chat --session demo "What did you find?"
+cargo run -p hermesd -- session list
+```
+
+State defaults to `~/.hermes-rs/state.db`; use the global `--state PATH`
+option for an isolated database. The runtime writes every tool plan to its
+effect ledger before dispatch and records its terminal result afterward.
+
+The bounded, deterministic single-agent proof and the live durable path use
+the same runtime. Recovery of interrupted pending effects and fenced
+multi-agent coordination are the next milestones.

@@ -10,21 +10,27 @@ language behind versioned, capability-limited boundaries.
 ## Dependency direction
 
 ```text
-apps/hermes
-    |
-    +--> providers --> ports
-    |
-    +--> local-tools -> ports
-    |
-    +--> runtime --> ports ------> domain
-    |       |
-    |       +-----> protocol ----> domain
-    |
-    +--> testkit --> protocol
+domain
+  ^
+  |
+protocol
+  ^
+  |
+ports <--------- runtime
+  ^                 ^
+  |                 |
+  +---------- hermesd
+               ├── CLI
+               ├── contract corpus support
+               └── adapters: OpenAI-compatible HTTP, local tools, SQLite
 ```
 
-Future provider, store, tool, gateway, and coordination implementations depend
-on `ports`. The domain never imports an implementation crate.
+`domain`, `protocol`, `ports`, and `runtime` are separate because they are
+kernel APIs that future executables and adapter packages can consume without
+linking HTTP, filesystem, SQLite, or CLI dependencies. Concrete adapters are
+ordinary modules in `hermesd`; they become crates only when a real second
+consumer, optional-dependency boundary, or distribution boundary appears. The
+domain never imports transport or implementation code.
 
 ## First proof
 
@@ -48,27 +54,43 @@ The first executable proof is the effect-free single-agent loop:
 ## First live edge
 
 The developer CLI can run that same loop against an OpenAI-compatible streaming
-endpoint. Provider JSON and SSE normalization live in `providers`, below the
-kernel-owned `Provider` trait. The provider adapter strips internal replay and
-execution metadata before sending tool-result messages over the wire.
+endpoint. Provider JSON and SSE normalization live in the `hermesd` adapter
+module, below the kernel-owned `Provider` trait. The provider adapter strips
+internal replay and execution metadata before sending tool-result messages
+over the wire.
 
-The only live tools are `read_file` and `search_files`. `local-tools`
+The only live tools are `read_file` and `search_files`. The local-tools adapter
 canonicalizes every requested path under one immutable root, blocks common
 credential and repository-internal paths, does not follow directory symlinks
 while walking, bounds input and output sizes, and always classifies plans as
 `read_only`. Unknown or invalid calls become typed failed terminals so the
 model can recover; they are never dynamically dispatched.
 
-The later durable proof will add SQLite-backed sessions and coordination:
+## Durable single-agent state
+
+`hermesd` now stores sessions and tool-effect records in SQLite. A session
+freezes its engine, provider, model, system prompt, ordered tool catalog, and
+tool root. Only complete user/assistant turns are appended. Every append uses
+an expected owner generation in one immediate transaction, so stale writers
+cannot partially extend the conversation.
+
+The journaled tool broker records an entire planned batch before executing any
+call, then records exactly one terminal result for each invocation. A process
+crash may therefore leave a visible `planned` record, but it cannot silently
+dispatch an unrecorded effect. The API key value is never persisted; only the
+name of its credential environment variable is part of session configuration.
+
+The durable proof currently covers:
 
 1. create an immutable session lineage and prompt manifest;
 2. persist a planned tool invocation before dispatch;
 3. persist each terminal outcome in actual completion order;
-4. materialize the provider result batch in original call order;
-5. delegate a child using a run-scoped lease and fencing token;
-6. terminate and recover the coordinator;
-7. reject writes from the stale worker; and
-8. emit one foreground result or one deduplicated background delivery.
+4. materialize the provider result batch in original call order; and
+5. resume a session from another CLI process without rebuilding its manifest.
+
+The next proof will reconcile interrupted pending effects. Multi-agent work
+then adds run-scoped leases and fencing, stale-worker rejection, and one
+deduplicated foreground or background delivery.
 
 ## Explicit non-goals for the sketch
 

@@ -2,9 +2,10 @@
 
 use std::fs;
 
-use local_tools::ReadOnlyLocalTools;
+use hermesd::adapters::{OpenAiCompatibleProvider, ReadOnlyLocalTools, SqliteEffectLedger};
+use ports::EffectLedger;
 use protocol::{AgentTurnRequest, ProviderMessage, TerminalStatus, TransportKind};
-use providers::OpenAiCompatibleProvider;
+use runtime::JournaledToolBroker;
 use serde_json::json;
 use tempfile::tempdir;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
@@ -84,7 +85,9 @@ async fn streamed_provider_tool_round_trip_uses_the_real_runtime()
 
     let mut provider =
         OpenAiCompatibleProvider::new(&format!("{}/v1", server.uri()), Some("test-key".into()))?;
-    let mut tools = ReadOnlyLocalTools::new(root.path(), "integration-turn")?;
+    let tools = ReadOnlyLocalTools::new(root.path(), "integration-turn")?;
+    let ledger = SqliteEffectLedger::in_memory()?;
+    let mut tools = JournaledToolBroker::new(tools, ledger, "integration-turn")?;
     let outcome = runtime::run_turn(
         AgentTurnRequest {
             execution_scope: "integration-turn".into(),
@@ -106,6 +109,8 @@ async fn streamed_provider_tool_round_trip_uses_the_real_runtime()
     );
     assert_eq!(outcome.provider_requests.len(), 2);
     assert_eq!(outcome.semantic_conversation.len(), 4);
+    let (_, mut ledger) = tools.into_parts();
+    assert!(ledger.pending()?.is_empty());
     let received = server
         .received_requests()
         .await

@@ -17,8 +17,10 @@ constraints in every change:
   stores.
 - Background delivery occurs at a legal new-turn boundary and is idempotent by
   event ID.
-- Keep adapters below traits in `ports`; domain crates do not depend on
-  transports, databases, plugins, or application crates.
+- Keep adapters below traits in `ports`; kernel crates do not depend on
+  transports, databases, plugins, or the application package.
+- Create crates only for a demonstrated reuse, executable, optional-dependency,
+  or distribution boundary. Use modules for internal subsystem organization.
 - Prefer behavior and property tests over snapshots of evolving catalogs.
 - No unsafe Rust without a separately reviewed architectural reason. The
   workspace currently forbids it.

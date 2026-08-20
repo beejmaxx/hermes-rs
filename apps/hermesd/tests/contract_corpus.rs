@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use futures_executor::block_on;
+use hermesd::contracts::{ContractCorpus, scripted_agent_turn};
 use protocol::ContractKind;
-use testkit::{ContractCorpus, scripted_agent_turn};
 
 fn contract_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/hermes-v1")

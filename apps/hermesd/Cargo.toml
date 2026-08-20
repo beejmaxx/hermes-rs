@@ -1,0 +1,44 @@
+[package]
+name = "hermesd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Executable Hermes Rust agent runtime and its concrete adapters"
+publish = false
+
+[[bin]]
+name = "hermesd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-stream.workspace = true
+clap.workspace = true
+dirs.workspace = true
+domain = { path = "../../crates/domain" }
+eventsource-stream.workspace = true
+futures-util.workspace = true
+globset.workspace = true
+ignore.workspace = true
+ports = { path = "../../crates/ports" }
+protocol = { path = "../../crates/protocol" }
+regex.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+runtime = { path = "../../crates/runtime" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+futures-executor.workspace = true
+tempfile.workspace = true
+wiremock.workspace = true

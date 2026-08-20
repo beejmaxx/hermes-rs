@@ -53,7 +53,7 @@ const PROTECTED_FILE_NAMES: &[&str] = &[
     "id_rsa",
 ];
 const PROTECTED_DIRECTORY_NAMES: &[&str] =
-    &[".aws", ".docker", ".git", ".gnupg", ".kube", ".ssh", "mcp-tokens"];
+    &[".aws", ".docker", ".git", ".gnupg", ".hermes-rs", ".kube", ".ssh", "mcp-tokens"];
 
 /// Configuration failure for the read-only local tool broker.
 #[derive(Debug, Error)]

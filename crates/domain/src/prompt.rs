@@ -21,6 +21,9 @@ pub struct ManifestDigest(String);
 /// Prompt manifest construction failed validation.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum PromptManifestError {
+    /// Manifest revisions are one-based.
+    #[error("prompt manifest revision must be greater than zero")]
+    ZeroRevision,
     /// An engine stamp was empty or padded.
     #[error("engine id must be non-empty and have no surrounding whitespace")]
     InvalidEngineId,
@@ -92,22 +95,81 @@ impl<'de> Deserialize<'de> for ManifestDigest {
 }
 
 /// Byte identity of the frozen prompt inputs for one conversation revision.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptManifest {
     /// Monotonic revision within a lineage.
-    pub revision: u64,
+    revision: u64,
     /// Immutable engine selected when the lineage was created.
-    pub engine: EngineId,
+    engine: EngineId,
     /// SHA-256 of the exact rendered system prompt bytes.
-    pub system_prompt: ManifestDigest,
+    system_prompt: ManifestDigest,
     /// SHA-256 of the exact ordered tool catalog bytes.
-    pub tool_catalog: ManifestDigest,
+    tool_catalog: ManifestDigest,
+}
+
+impl PromptManifest {
+    /// Construct a validated immutable prompt manifest.
+    pub fn new(
+        revision: u64,
+        engine: EngineId,
+        system_prompt: ManifestDigest,
+        tool_catalog: ManifestDigest,
+    ) -> Result<Self, PromptManifestError> {
+        if revision == 0 {
+            return Err(PromptManifestError::ZeroRevision);
+        }
+        Ok(Self { revision, engine, system_prompt, tool_catalog })
+    }
+
+    /// Monotonic one-based revision within a lineage.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Immutable engine identity.
+    #[must_use]
+    pub const fn engine(&self) -> &EngineId {
+        &self.engine
+    }
+
+    /// Digest of exact system-prompt bytes.
+    #[must_use]
+    pub const fn system_prompt(&self) -> &ManifestDigest {
+        &self.system_prompt
+    }
+
+    /// Digest of canonical ordered tool-catalog bytes.
+    #[must_use]
+    pub const fn tool_catalog(&self) -> &ManifestDigest {
+        &self.tool_catalog
+    }
+}
+
+impl<'de> Deserialize<'de> for PromptManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Repr {
+            revision: u64,
+            engine: EngineId,
+            system_prompt: ManifestDigest,
+            tool_catalog: ManifestDigest,
+        }
+
+        let repr = Repr::deserialize(deserializer)?;
+        Self::new(repr.revision, repr.engine, repr.system_prompt, repr.tool_catalog)
+            .map_err(de::Error::custom)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineId, ManifestDigest};
+    use super::{EngineId, ManifestDigest, PromptManifest};
 
     #[test]
     fn digest_requires_canonical_lowercase_sha256() {
@@ -121,5 +183,25 @@ mod tests {
         assert_eq!(EngineId::new("rust-v1").map(|id| id.as_str().to_owned()), Ok("rust-v1".into()));
         assert!(EngineId::new(" rust-v1").is_err());
         assert!(serde_json::from_str::<EngineId>(r#"""#).is_err());
+    }
+
+    #[test]
+    fn manifest_revisions_are_one_based_even_during_deserialization() {
+        let digest = "a".repeat(64);
+        assert!(
+            PromptManifest::new(
+                1,
+                EngineId::new("rust-v1").unwrap_or_else(|error| unreachable!("valid id: {error}")),
+                ManifestDigest::new(digest.clone())
+                    .unwrap_or_else(|error| unreachable!("valid digest: {error}")),
+                ManifestDigest::new(digest.clone())
+                    .unwrap_or_else(|error| unreachable!("valid digest: {error}")),
+            )
+            .is_ok()
+        );
+        let encoded = format!(
+            r#"{{"revision":0,"engine":"rust-v1","system_prompt":"{digest}","tool_catalog":"{digest}"}}"#
+        );
+        assert!(serde_json::from_str::<PromptManifest>(&encoded).is_err());
     }
 }
