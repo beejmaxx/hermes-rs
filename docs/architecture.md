@@ -91,9 +91,12 @@ The durable proof currently covers:
 4. materialize the provider result batch in original call order; and
 5. resume a session from another CLI process without rebuilding its manifest.
 
-The next durable proof will reconcile interrupted pending effects. Durable
-multi-agent work then adds run-scoped leases and fencing, stale-worker
-rejection, and one deduplicated foreground or background delivery.
+The next durable proof will reconcile interrupted pending effects. The
+background-delegation substrate now has generation-guarded claims, worker
+leases and fencing, `outcome_unknown` reconciliation, and a claimed completion
+outbox. See [durable-delegation.md](durable-delegation.md). A long-lived host
+still needs to connect that state machine to child execution and legal
+new-turn delivery before background delegation is advertised.
 
 ## Leaf delegation
 
@@ -111,8 +114,9 @@ projects their tool results back to the provider in original call order.
 
 This is deliberately synchronous and leaf-only. Background delivery,
 steering, cancellation, reconnect-after-restart, and durable worker leases are
-not inferred from the old Kanban workflow; they will be added around this
-concrete child lifecycle.
+not inferred from the old Kanban workflow. The persistence contract underneath
+those features is now explicit, but this tool continues to wait for its child
+until the supervisor and delivery host are wired end to end.
 
 ## Explicit non-goals for the sketch
 

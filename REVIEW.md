@@ -14,6 +14,8 @@
 - Multi-process CLI session resume against the real runtime
 - Leaf-only delegation through an isolated nested runtime, with child effects
   journaled under their own scopes
+- Durable delegation claims with owner generations, worker fencing, lease-expiry
+  reconciliation, and an atomically written completion outbox
 
 ## Current package decisions
 
@@ -35,8 +37,9 @@
 ## Deferred
 
 - Reconciliation policy for effects left pending by a crash
-- Durable child lifecycle: background execution, cancellation, steering,
-  leases, fencing, and restart recovery
+- Long-lived child execution and legal new-turn delivery over the durable
+  delegation state machine
+- Cancellation, steering, and explicitly replay-safe restart policy
 - Branching a new lineage when a user intentionally changes model or manifest
 - Public gateway/JSON-RPC integration with existing Hermes clients
 - Task claims, leases, fencing, inbox/outbox delivery, and coordinator recovery

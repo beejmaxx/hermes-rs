@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// SQLite-backed single-writer durable session repository.
 pub struct SqliteSessionStore {
@@ -42,6 +42,10 @@ impl SqliteSessionStore {
     pub fn in_memory() -> Result<Self, SessionStoreError> {
         let connection = Connection::open_in_memory().map_err(storage_error)?;
         Self::initialize(connection)
+    }
+
+    pub(super) fn into_connection(self) -> Connection {
+        self.connection
     }
 
     fn initialize(connection: Connection) -> Result<Self, SessionStoreError> {
@@ -143,12 +147,86 @@ impl SqliteSessionStore {
                     )
                     .map_err(storage_error)?;
             }
-            SCHEMA_VERSION => {}
+            2 | SCHEMA_VERSION => {}
             other => {
                 return Err(SessionStoreError::Storage(format!(
                     "unsupported SQLite schema version {other}; expected {SCHEMA_VERSION}"
                 )));
             }
+        }
+        if version <= 2 {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE delegations (
+                         delegation_id TEXT PRIMARY KEY NOT NULL,
+                         completion_event_id TEXT UNIQUE NOT NULL,
+                         parent_session_id TEXT NOT NULL,
+                         child_session_id TEXT UNIQUE NOT NULL,
+                         goal TEXT NOT NULL,
+                         context TEXT,
+                         state TEXT NOT NULL,
+                         owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+                         worker_id TEXT,
+                         fencing_token INTEGER NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
+                         lease_expires_at_ms INTEGER,
+                         terminal_json TEXT,
+                         created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                         updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+                         FOREIGN KEY (parent_session_id) REFERENCES sessions(session_id),
+                         FOREIGN KEY (child_session_id) REFERENCES sessions(session_id),
+                         CHECK (state IN (
+                             'pending', 'running', 'completed', 'failed', 'cancelled',
+                             'outcome_unknown'
+                         )),
+                         CHECK (
+                             (state = 'pending' AND worker_id IS NULL AND fencing_token = 0
+                                 AND lease_expires_at_ms IS NULL AND terminal_json IS NULL)
+                             OR (state = 'running' AND worker_id IS NOT NULL
+                                 AND fencing_token > 0 AND lease_expires_at_ms IS NOT NULL
+                                 AND terminal_json IS NULL)
+                             OR (state IN ('completed', 'failed', 'cancelled', 'outcome_unknown')
+                                 AND fencing_token > 0 AND lease_expires_at_ms IS NULL
+                                 AND terminal_json IS NOT NULL)
+                         )
+                     );
+                     CREATE INDEX pending_delegations
+                         ON delegations(created_at_ms, delegation_id) WHERE state = 'pending';
+                     CREATE INDEX leased_delegations
+                         ON delegations(lease_expires_at_ms, delegation_id) WHERE state = 'running';
+                     CREATE TABLE delegation_completions (
+                         event_id TEXT PRIMARY KEY NOT NULL,
+                         delegation_id TEXT UNIQUE NOT NULL,
+                         payload_json TEXT NOT NULL,
+                         delivery_state TEXT NOT NULL DEFAULT 'pending',
+                         delivery_claim_id TEXT,
+                         delivery_claim_expires_at_ms INTEGER,
+                         delivery_attempts INTEGER NOT NULL DEFAULT 0
+                             CHECK (delivery_attempts >= 0),
+                         created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                         delivered_at_ms INTEGER,
+                         FOREIGN KEY (delegation_id) REFERENCES delegations(delegation_id),
+                         CHECK (delivery_state IN ('pending', 'delivered')),
+                         CHECK (
+                             (delivery_claim_id IS NULL
+                                 AND delivery_claim_expires_at_ms IS NULL)
+                             OR (delivery_claim_id IS NOT NULL
+                                 AND delivery_claim_expires_at_ms IS NOT NULL)
+                         ),
+                         CHECK (
+                             (delivery_state = 'pending' AND delivered_at_ms IS NULL)
+                             OR (delivery_state = 'delivered' AND delivered_at_ms IS NOT NULL
+                                 AND delivery_claim_id IS NULL
+                                 AND delivery_claim_expires_at_ms IS NULL)
+                         )
+                     );
+                     CREATE INDEX pending_delegation_completions
+                         ON delegation_completions(created_at_ms, event_id)
+                         WHERE delivery_state = 'pending';
+                     PRAGMA user_version = 3;
+                     COMMIT;",
+                )
+                .map_err(storage_error)?;
         }
         Ok(Self { connection })
     }

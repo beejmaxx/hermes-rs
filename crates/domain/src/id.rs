@@ -83,6 +83,18 @@ macro_rules! opaque_id {
 opaque_id!(SessionId, "A runtime session identifier.", "session id");
 opaque_id!(LineageId, "An immutable conversation lineage identifier.", "lineage id");
 opaque_id!(ToolCallId, "A model-issued tool invocation identifier.", "tool call id");
+opaque_id!(DelegationId, "A durable background-delegation identifier.", "delegation id");
+opaque_id!(
+    DelegationWorkerId,
+    "A process-scoped worker identity claiming one delegation.",
+    "delegation worker id"
+);
+opaque_id!(
+    CompletionEventId,
+    "An idempotency identity for one background completion.",
+    "completion event id"
+);
+opaque_id!(DeliveryClaimId, "A short-lived claim on one completion delivery.", "delivery claim id");
 
 macro_rules! authority_counter {
     ($name:ident, $doc:literal, $kind:literal) => {
@@ -127,9 +139,14 @@ authority_counter!(
     "A monotonically increasing write-authority generation.",
     "owner generation"
 );
+authority_counter!(
+    FencingToken,
+    "A monotonically increasing token fencing stale delegation workers.",
+    "fencing token"
+);
 #[cfg(test)]
 mod tests {
-    use super::{OwnerGeneration, SessionId};
+    use super::{FencingToken, OwnerGeneration, SessionId};
 
     #[test]
     fn opaque_ids_reject_empty_and_padded_values() {
@@ -142,7 +159,9 @@ mod tests {
     #[test]
     fn authority_counters_are_nonzero() {
         assert!(OwnerGeneration::new(0).is_err());
+        assert!(FencingToken::new(0).is_err());
         assert_eq!(OwnerGeneration::new(7).map(OwnerGeneration::get), Ok(7));
+        assert_eq!(FencingToken::new(9).map(FencingToken::get), Ok(9));
     }
 
     #[test]

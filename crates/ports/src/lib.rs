@@ -3,13 +3,15 @@
 use std::pin::Pin;
 
 use domain::{
-    OwnerGeneration, PlannedToolCall, SemanticMessage, SessionId, ToolCall, ToolTerminal,
+    CompletionEventId, DelegationId, DelegationSpec, DelegationTerminal, DelegationWorkerId,
+    DeliveryClaimId, FencingToken, OwnerGeneration, PlannedToolCall, SemanticMessage, SessionId,
+    ToolCall, ToolTerminal,
 };
 use futures_core::Stream;
 use futures_util::future::BoxFuture;
 use protocol::{
-    ChatCompletionsRequest, PendingEffect, ProviderEvent, SessionConfig, SessionSnapshot,
-    SessionSummary,
+    ChatCompletionsRequest, DelegationCompletion, DelegationSnapshot, PendingEffect, ProviderEvent,
+    SessionConfig, SessionSnapshot, SessionSummary,
 };
 use thiserror::Error;
 
@@ -134,6 +136,141 @@ pub trait SessionStore: Send {
 
     /// List compact session records, newest first.
     fn list(&mut self) -> Result<Vec<SessionSummary>, SessionStoreError>;
+}
+
+/// A durable background-delegation operation failed.
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum DelegationStoreError {
+    /// A create operation reused a durable delegation identity.
+    #[error("delegation already exists: {0}")]
+    AlreadyExists(DelegationId),
+    /// A requested delegation did not exist.
+    #[error("delegation not found: {0}")]
+    NotFound(DelegationId),
+    /// The run was not in the state required by the requested transition.
+    #[error("delegation {delegation_id} cannot transition from state {state}")]
+    NotClaimable {
+        /// Conflicting delegation.
+        delegation_id: DelegationId,
+        /// Persisted lifecycle state.
+        state: String,
+    },
+    /// Another authoritative writer advanced the run generation first.
+    #[error(
+        "delegation {delegation_id} write conflict: expected generation {expected}, actual {actual}"
+    )]
+    GenerationConflict {
+        /// Conflicting delegation.
+        delegation_id: DelegationId,
+        /// Generation supplied by the caller.
+        expected: u64,
+        /// Current durable generation.
+        actual: u64,
+    },
+    /// A stale worker attempted to mutate a newer or terminal run.
+    #[error(
+        "delegation {delegation_id} fencing conflict: expected token {expected}, actual {actual:?}"
+    )]
+    FencingConflict {
+        /// Conflicting delegation.
+        delegation_id: DelegationId,
+        /// Token supplied by the worker.
+        expected: u64,
+        /// Current token, absent before the first claim.
+        actual: Option<u64>,
+    },
+    /// Input or stored delegation state violated an invariant.
+    #[error("invalid delegation state: {0}")]
+    Invalid(String),
+    /// The delegation repository failed.
+    #[error("delegation storage failed: {0}")]
+    Storage(String),
+}
+
+/// Durable lease, fencing, terminal, and completion-outbox repository.
+pub trait DelegationStore: Send {
+    /// Durably accept one background unit before any worker can run it.
+    fn create(
+        &mut self,
+        spec: DelegationSpec,
+        now_ms: u64,
+    ) -> Result<DelegationSnapshot, DelegationStoreError>;
+
+    /// Load one complete durable run.
+    fn load(
+        &mut self,
+        delegation_id: &DelegationId,
+    ) -> Result<DelegationSnapshot, DelegationStoreError>;
+
+    /// List unclaimed work in deterministic creation order.
+    fn pending(&mut self, limit: usize) -> Result<Vec<DelegationSnapshot>, DelegationStoreError>;
+
+    /// Claim pending work and mint its first fencing token.
+    fn claim(
+        &mut self,
+        delegation_id: &DelegationId,
+        expected_generation: OwnerGeneration,
+        worker_id: DelegationWorkerId,
+        now_ms: u64,
+        lease_expires_at_ms: u64,
+    ) -> Result<DelegationSnapshot, DelegationStoreError>;
+
+    /// Extend the lease held by the current worker generation.
+    fn heartbeat(
+        &mut self,
+        delegation_id: &DelegationId,
+        expected_generation: OwnerGeneration,
+        fencing_token: FencingToken,
+        now_ms: u64,
+        lease_expires_at_ms: u64,
+    ) -> Result<DelegationSnapshot, DelegationStoreError>;
+
+    /// Atomically record a terminal child outcome and its one completion event.
+    fn finish(
+        &mut self,
+        delegation_id: &DelegationId,
+        expected_generation: OwnerGeneration,
+        fencing_token: FencingToken,
+        outcome: DelegationTerminal,
+        completed_at_ms: u64,
+    ) -> Result<DelegationCompletion, DelegationStoreError>;
+
+    /// Mark every expired running owner as outcome-unknown and enqueue completions.
+    fn reconcile_expired(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Vec<DelegationCompletion>, DelegationStoreError>;
+
+    /// List completion events whose delivery claim is absent or expired.
+    fn available_completions(
+        &mut self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<DelegationCompletion>, DelegationStoreError>;
+
+    /// Claim one pending completion across competing delivery consumers.
+    fn claim_completion(
+        &mut self,
+        event_id: &CompletionEventId,
+        claim_id: DeliveryClaimId,
+        now_ms: u64,
+        claim_expires_at_ms: u64,
+    ) -> Result<Option<DelegationCompletion>, DelegationStoreError>;
+
+    /// Acknowledge a completion accepted at a legal new-turn boundary.
+    fn acknowledge_completion(
+        &mut self,
+        event_id: &CompletionEventId,
+        claim_id: &DeliveryClaimId,
+        delivered_at_ms: u64,
+    ) -> Result<bool, DelegationStoreError>;
+
+    /// Release a transiently failed delivery claim for a later consumer.
+    fn release_completion(
+        &mut self,
+        event_id: &CompletionEventId,
+        claim_id: &DeliveryClaimId,
+    ) -> Result<bool, DelegationStoreError>;
 }
 
 /// Durable effect-ledger operation failed.

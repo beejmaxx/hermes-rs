@@ -3,10 +3,14 @@
 //! Dynamic JSON is permitted here only where a provider-specific or recorded
 //! test payload is intentionally opaque to the domain.
 
+mod delegation;
+
 use domain::{LineageId, OwnerGeneration, PromptManifest, SemanticMessage, SessionId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+pub use delegation::{DelegationCompletion, DelegationSnapshot};
 
 /// Schema marker shared by the Python oracle and this Rust reader.
 pub const CONTRACT_SCHEMA_V1: &str = "hermes-rewrite-contract/v1";

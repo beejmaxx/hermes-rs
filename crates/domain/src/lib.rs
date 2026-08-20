@@ -3,6 +3,7 @@
 //! This crate has no transport, database, process, or async-runtime dependency.
 
 mod conversation;
+mod delegation;
 mod effect;
 mod id;
 mod prompt;
@@ -11,6 +12,10 @@ pub use conversation::{
     Conversation, ConversationError, SemanticMessage, ToolArguments, ToolCall, ToolResult,
     ToolResultStatus,
 };
+pub use delegation::{DelegationSpec, DelegationState, DelegationTerminal};
 pub use effect::{ApprovalRecord, PlannedToolCall, ToolEffect, ToolTerminal};
-pub use id::{IdError, LineageId, OwnerGeneration, SessionId, ToolCallId};
+pub use id::{
+    CompletionEventId, DelegationId, DelegationWorkerId, DeliveryClaimId, FencingToken, IdError,
+    LineageId, OwnerGeneration, SessionId, ToolCallId,
+};
 pub use prompt::{EngineId, ManifestDigest, PromptManifest, PromptManifestError};
