@@ -5,7 +5,7 @@ use std::{
     process::{Command, Output},
 };
 
-use hermesd::adapters::{ReadOnlyLocalTools, SqliteSessionStore};
+use hermesd::adapters::{AgentTools, SqliteSessionStore};
 use ports::SessionStore;
 use serde_json::json;
 use tempfile::tempdir;
@@ -22,10 +22,10 @@ async fn separate_cli_processes_resume_one_frozen_session() -> Result<(), Box<dy
     let server = MockServer::start().await;
     let base_url = format!("{}/v1", server.uri());
     let system = format!(
-        "You are Hermes RS, a precise and helpful agent. You may inspect the workspace at {} using read_file and search_files. These tools are read-only. Never claim to have modified files or run commands.",
+        "You are Hermes RS, a precise and helpful agent. You may inspect the workspace at {} using read_file and search_files. These tools are read-only. You may delegate focused independent subtasks to isolated leaf agents. Never claim to have modified files or run commands.",
         root.display()
     );
-    let tools = ReadOnlyLocalTools::catalog();
+    let tools = AgentTools::catalog();
 
     Mock::given(matchers::method("POST"))
         .and(matchers::path("/v1/chat/completions"))
@@ -53,7 +53,7 @@ async fn separate_cli_processes_resume_one_frozen_session() -> Result<(), Box<dy
                 {"role": "assistant", "content": "First answer."},
                 {"role": "user", "content": "second"}
             ],
-            "tools": ReadOnlyLocalTools::catalog(),
+            "tools": AgentTools::catalog(),
             "stream": true,
             "stream_options": {"include_usage": true}
         })))

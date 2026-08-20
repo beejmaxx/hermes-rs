@@ -34,6 +34,7 @@ pub fn list_pending_effects(state_override: Option<&Path>) -> anyhow::Result<()>
 const fn effect_name(effect: ToolEffect) -> &'static str {
     match effect {
         ToolEffect::ReadOnly => "read_only",
+        ToolEffect::ModelInference => "model_inference",
         ToolEffect::LocalMutation => "local_mutation",
         ToolEffect::ExternalMutation => "external_mutation",
         ToolEffect::ProcessControl => "process_control",

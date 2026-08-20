@@ -18,7 +18,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::adapters::{
-    OpenAiCompatibleProvider, ReadOnlyLocalTools, SqliteEffectLedger, SqliteSessionStore,
+    AgentTools, AgentToolsConfig, OpenAiCompatibleProvider, ReadOnlyLocalTools, SqliteEffectLedger,
+    SqliteSessionStore,
 };
 use crate::cli::state::state_path;
 
@@ -171,8 +172,16 @@ async fn execute_turn(
     state: &Path,
 ) -> anyhow::Result<ContractOutcome> {
     let api_key = read_api_key(settings.api_key_env.as_deref())?;
-    let mut provider = OpenAiCompatibleProvider::new(&settings.base_url, api_key)?;
-    let tools = ReadOnlyLocalTools::new(&settings.root, scope)?;
+    let mut provider = OpenAiCompatibleProvider::new(&settings.base_url, api_key.clone())?;
+    let tools_config = AgentToolsConfig::new(
+        settings.root.clone(),
+        state.to_path_buf(),
+        settings.base_url.clone(),
+        api_key,
+        settings.model.clone(),
+        AgentTools::catalog_enables_delegation(&settings.tools),
+    )?;
+    let tools = AgentTools::new(tools_config, scope)?;
     let ledger = SqliteEffectLedger::open(state)
         .with_context(|| format!("could not open effect ledger {}", state.display()))?;
     let mut tools = JournaledToolBroker::new(tools, ledger, scope)?;
@@ -233,7 +242,7 @@ impl LiveSettings {
             arguments.api_key_env.clone().or_else(|| default_api_key_env.map(str::to_owned));
         let system_prompt = arguments.system.clone().unwrap_or_else(|| {
             format!(
-                "You are Hermes RS, a precise and helpful agent. You may inspect the workspace at {} using read_file and search_files. These tools are read-only. Never claim to have modified files or run commands.",
+                "You are Hermes RS, a precise and helpful agent. You may inspect the workspace at {} using read_file and search_files. These tools are read-only. You may delegate focused independent subtasks to isolated leaf agents. Never claim to have modified files or run commands.",
                 root.display()
             )
         });
@@ -244,7 +253,7 @@ impl LiveSettings {
             model: model.into(),
             root,
             system_prompt,
-            tools: ReadOnlyLocalTools::catalog(),
+            tools: AgentTools::catalog(),
         })
     }
 

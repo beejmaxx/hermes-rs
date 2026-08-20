@@ -59,7 +59,8 @@ module, below the kernel-owned `Provider` trait. The provider adapter strips
 internal replay and execution metadata before sending tool-result messages
 over the wire.
 
-The only live tools are `read_file` and `search_files`. The local-tools adapter
+The only direct workspace tools are `read_file` and `search_files`. The
+local-tools adapter
 canonicalizes every requested path under one immutable root, blocks common
 credential and repository-internal paths, does not follow directory symlinks
 while walking, bounds input and output sizes, and always classifies plans as
@@ -90,9 +91,28 @@ The durable proof currently covers:
 4. materialize the provider result batch in original call order; and
 5. resume a session from another CLI process without rebuilding its manifest.
 
-The next proof will reconcile interrupted pending effects. Multi-agent work
-then adds run-scoped leases and fencing, stale-worker rejection, and one
-deduplicated foreground or background delivery.
+The next durable proof will reconcile interrupted pending effects. Durable
+multi-agent work then adds run-scoped leases and fencing, stale-worker
+rejection, and one deduplicated foreground or background delivery.
+
+## Leaf delegation
+
+New parent sessions advertise one additional `delegate_task` tool. It launches
+a focused child turn through the same provider-neutral runtime, but with a
+fresh conversation, a task-specific system prompt, the parent's frozen
+provider/model and workspace root, and only `read_file`/`search_files`. The
+child cannot delegate, interact with the user, or mutate the workspace.
+
+The delegation invocation is journaled as `model_inference`; any child tool
+calls are separately journaled beneath a deterministic child execution scope.
+The parent receives only a bounded final summary. Multiple delegation calls in
+one provider response are polled concurrently, while the runtime still
+projects their tool results back to the provider in original call order.
+
+This is deliberately synchronous and leaf-only. Background delivery,
+steering, cancellation, reconnect-after-restart, and durable worker leases are
+not inferred from the old Kanban workflow; they will be added around this
+concrete child lifecycle.
 
 ## Explicit non-goals for the sketch
 

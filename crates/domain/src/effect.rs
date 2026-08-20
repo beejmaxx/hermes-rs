@@ -11,6 +11,8 @@ use crate::{ToolArguments, ToolCallId, ToolResultStatus};
 pub enum ToolEffect {
     /// Reads state without changing it.
     ReadOnly,
+    /// Performs a potentially billable model inference without granting child mutation rights.
+    ModelInference,
     /// Mutates only the local machine or workspace.
     LocalMutation,
     /// Mutates a remote system.

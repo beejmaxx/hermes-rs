@@ -12,6 +12,8 @@
 - A write-ahead tool-effect ledger with duplicate-dispatch protection
 - Operator visibility into effects left pending by an interrupted process
 - Multi-process CLI session resume against the real runtime
+- Leaf-only delegation through an isolated nested runtime, with child effects
+  journaled under their own scopes
 
 ## Current package decisions
 
@@ -26,12 +28,15 @@
    transport constraint requires a sidecar.
 5. Persist only complete replayable turns; failures never leave an unresolved
    assistant tool request in session history.
-6. Keep task and lease types provisional until coordination is the active
-   milestone.
+6. Do not retain Kanban-shaped task states without a runtime consumer; the
+   first durable subagent supervisor will define its lifecycle from observed
+   parent/child behavior.
 
 ## Deferred
 
 - Reconciliation policy for effects left pending by a crash
+- Durable child lifecycle: background execution, cancellation, steering,
+  leases, fencing, and restart recovery
 - Branching a new lineage when a user intentionally changes model or manifest
 - Public gateway/JSON-RPC integration with existing Hermes clients
 - Task claims, leases, fencing, inbox/outbox delivery, and coordinator recovery

@@ -127,6 +127,25 @@ where
     P: Provider,
     T: ToolBroker,
 {
+    run_turn_with_limit(request, provider, tools, MAX_ATTEMPTS_PER_TURN).await
+}
+
+/// Execute one turn with an explicit provider-attempt budget.
+pub async fn run_turn_with_limit<P, T>(
+    request: AgentTurnRequest,
+    provider: &mut P,
+    tools: &mut T,
+    max_attempts: usize,
+) -> Result<ContractOutcome, RuntimeError>
+where
+    P: Provider,
+    T: ToolBroker,
+{
+    if max_attempts == 0 {
+        return Err(RuntimeError::InvalidTurn(
+            "turn provider-attempt budget must be greater than zero".into(),
+        ));
+    }
     validate_request(&request)?;
 
     let AgentTurnRequest {
@@ -154,9 +173,9 @@ where
 
     let terminal_outcome = loop {
         attempt_count += 1;
-        if attempt_count > MAX_ATTEMPTS_PER_TURN {
+        if attempt_count > max_attempts {
             return Err(RuntimeError::InvalidTurn(format!(
-                "turn exceeded {MAX_ATTEMPTS_PER_TURN} provider attempts"
+                "turn exceeded {max_attempts} provider attempts"
             )));
         }
 

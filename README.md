@@ -54,9 +54,10 @@ cargo run -p hermesd -- contract check contracts/hermes-v1
 
 The live path supports OpenAI, OpenRouter, and custom OpenAI-compatible
 endpoints. Credentials are read only from the selected environment variable;
-they are never accepted as command-line arguments. The only enabled tools are
-read-only and confined to `--root`; common credential paths such as `.env`,
-`.ssh`, and `.git` are denied even when they are beneath that root.
+they are never accepted as command-line arguments. The enabled capabilities are
+read-only workspace inspection plus leaf delegation. Filesystem access is
+confined to `--root`; common credential paths such as `.env`, `.ssh`, and
+`.git` are denied even when they are beneath that root.
 
 ```bash
 export OPENROUTER_API_KEY="..."
@@ -95,6 +96,15 @@ effect ledger before dispatch and records its terminal result afterward.
 `effect pending` exposes records left between those writes by an interrupted
 process; it does not retry them automatically.
 
-The bounded, deterministic single-agent proof and the live durable path use
-the same runtime. Recovery of interrupted pending effects and fenced
-multi-agent coordination are the next milestones.
+New sessions can use `delegate_task` for focused independent work. Each child
+gets a fresh context, the same provider/model and workspace root, only the
+read-only tools, a 32-attempt budget, and no ability to delegate recursively.
+Multiple delegation calls from one model response run concurrently. Only each
+child's final bounded summary returns to the parent; its intermediate messages
+and tool calls remain isolated, while its effects use a distinct durable
+journal scope. Existing sessions keep their frozen older tool catalog rather
+than gaining this capability mid-lineage.
+
+The bounded contracts, live durable path, and delegated child turns use the
+same runtime. Recovery of interrupted pending effects and durable child
+supervision are the next milestones.
