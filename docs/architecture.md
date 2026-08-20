@@ -12,6 +12,10 @@ language behind versioned, capability-limited boundaries.
 ```text
 apps/hermes
     |
+    +--> providers --> ports
+    |
+    +--> local-tools -> ports
+    |
     +--> runtime --> ports ------> domain
     |       |
     |       +-----> protocol ----> domain
@@ -24,11 +28,11 @@ on `ports`. The domain never imports an implementation crate.
 
 ## First proof
 
-The initial implementation remains offline. It reads the same deterministic
-fixtures as the Python reference oracle and validates semantic conversation,
-provider request, persistence intent, public event, usage, and terminal outcome
-records. No test calls a live provider or performs a filesystem, process,
-credential, or network effect.
+The conformance suite remains offline. It reads the same deterministic fixtures
+as the Python reference oracle and validates semantic conversation, provider
+request, persistence intent, public event, usage, and terminal outcome records.
+No test calls a live provider or performs a filesystem, process, credential, or
+network effect.
 
 The first executable proof is the effect-free single-agent loop:
 
@@ -40,6 +44,20 @@ The first executable proof is the effect-free single-agent loop:
 6. apply fallback only before visible output;
 7. classify cancellation, malformed, and truncated streams; and
 8. reproduce the pinned Python oracle outcomes exactly.
+
+## First live edge
+
+The developer CLI can run that same loop against an OpenAI-compatible streaming
+endpoint. Provider JSON and SSE normalization live in `providers`, below the
+kernel-owned `Provider` trait. The provider adapter strips internal replay and
+execution metadata before sending tool-result messages over the wire.
+
+The only live tools are `read_file` and `search_files`. `local-tools`
+canonicalizes every requested path under one immutable root, blocks common
+credential and repository-internal paths, does not follow directory symlinks
+while walking, bounds input and output sizes, and always classifies plans as
+`read_only`. Unknown or invalid calls become typed failed terminals so the
+model can recover; they are never dynamically dispatched.
 
 The later durable proof will add SQLite-backed sessions and coordination:
 

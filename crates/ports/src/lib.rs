@@ -46,8 +46,10 @@ impl ProviderError {
 /// A model-provider transport capable of starting normalized streams.
 pub trait Provider: Send {
     /// Submit one provider request and return its identified event stream.
-    fn stream(&mut self, request: ChatCompletionsRequest)
-    -> Result<ProviderAttempt, ProviderError>;
+    fn stream<'a>(
+        &'a mut self,
+        request: ChatCompletionsRequest,
+    ) -> BoxFuture<'a, Result<ProviderAttempt, ProviderError>>;
 
     /// Remaining scripted attempts, when the implementation is deterministic.
     fn remaining_attempts(&self) -> Option<usize> {

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Offline developer CLI for the experimental Hermes Rust kernel"
+description = "Developer CLI for the experimental Hermes Rust kernel"
 publish = false
 
 [[bin]]
@@ -15,11 +15,13 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-futures-executor.workspace = true
+local-tools = { path = "../../crates/local-tools" }
 protocol = { path = "../../crates/protocol" }
+providers = { path = "../../crates/providers" }
 runtime = { path = "../../crates/runtime" }
 serde_json.workspace = true
 testkit = { path = "../../crates/testkit" }
+tokio.workspace = true
 
 [lints]
 workspace = true

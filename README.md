@@ -1,6 +1,6 @@
 # Hermes RS
 
-An experimental, contract-first Rust sketch of the Hermes agent backend.
+An experimental, contract-first Rust implementation of the Hermes agent backend.
 
 This is not currently a drop-in replacement for `hermes-agent`, and parity is
 not the first milestone. The project exists to test whether a typed Rust kernel
@@ -32,9 +32,11 @@ cannot mutate authoritative state directly.
 - `domain`: pure identifiers, semantic messages, and state transitions
 - `protocol`: versioned serializable boundary types
 - `ports`: traits owned by the kernel rather than adapters
-- `runtime`: effect-free agent loop over provider and tool ports
+- `runtime`: provider-neutral agent loop over provider and tool ports
+- `providers`: live OpenAI-compatible HTTP/SSE adapter
+- `local-tools`: root-confined `read_file` and `search_files` broker
 - `testkit`: readers and helpers for the shared contract corpus
-- `apps/hermes`: offline developer CLI; no live model or tool effects yet
+- `apps/hermes`: contract and live single-turn developer CLI
 
 ## Development
 
@@ -45,9 +47,35 @@ cargo test --workspace
 cargo run -p hermes-cli -- contract check contracts/hermes-v1
 ```
 
-The first go/no-go proof is a bounded, effect-free single-agent turn. The Rust
-runtime must execute every pinned `agent_turn` fixture and reproduce its
+## Try a live turn
+
+The live path supports OpenAI, OpenRouter, and custom OpenAI-compatible
+endpoints. Credentials are read only from the selected environment variable;
+they are never accepted as command-line arguments. The only enabled tools are
+read-only and confined to `--root`; common credential paths such as `.env`,
+`.ssh`, and `.git` are denied even when they are beneath that root.
+
+```bash
+export OPENROUTER_API_KEY="..."
+cargo run -p hermes-cli -- chat \
+  --provider openrouter \
+  --model your-model-id \
+  --root . \
+  "Read the project README and explain the architecture."
+```
+
+For a local server that needs no credential:
+
+```bash
+cargo run -p hermes-cli -- chat \
+  --provider custom \
+  --base-url http://127.0.0.1:11434/v1 \
+  --model your-model \
+  "Say hello."
+```
+
+The first go/no-go proof remains a bounded, deterministic single-agent turn.
+The Rust runtime executes every pinned `agent_turn` fixture and reproduces its
 provider requests, semantic conversation, persistence intents, public events,
-usage, and terminal outcome. The next milestone adds one live provider and
-read-only local tools; durable coordination follows only after the single-agent
-runtime is usable.
+usage, and terminal outcome. The live edge now exercises that same runtime;
+durable sessions and coordination come next.

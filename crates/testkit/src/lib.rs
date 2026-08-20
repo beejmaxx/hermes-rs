@@ -313,25 +313,28 @@ impl ScriptedProvider {
 }
 
 impl Provider for ScriptedProvider {
-    fn stream(
-        &mut self,
+    fn stream<'a>(
+        &'a mut self,
         _request: protocol::ChatCompletionsRequest,
-    ) -> Result<ProviderAttempt, ProviderError> {
-        let step = self
-            .steps
-            .get(self.cursor)
-            .cloned()
-            .ok_or_else(|| ProviderError::new("provider script exhausted"))?;
-        self.cursor += 1;
-        Ok(ProviderAttempt {
-            attempt_id: step.attempt_id,
-            error_policy: if step.on_error.as_deref() == Some("fallback") {
-                AttemptErrorPolicy::FallbackBeforeVisibleOutput
-            } else {
-                AttemptErrorPolicy::Stop
-            },
-            events: Box::pin(stream::iter(step.events.into_iter().map(Ok))),
-        })
+    ) -> BoxFuture<'a, Result<ProviderAttempt, ProviderError>> {
+        async move {
+            let step = self
+                .steps
+                .get(self.cursor)
+                .cloned()
+                .ok_or_else(|| ProviderError::new("provider script exhausted"))?;
+            self.cursor += 1;
+            Ok(ProviderAttempt {
+                attempt_id: step.attempt_id,
+                error_policy: if step.on_error.as_deref() == Some("fallback") {
+                    AttemptErrorPolicy::FallbackBeforeVisibleOutput
+                } else {
+                    AttemptErrorPolicy::Stop
+                },
+                events: Box::pin(stream::iter(step.events.into_iter().map(Ok))),
+            })
+        }
+        .boxed()
     }
 
     fn remaining_attempts(&self) -> Option<usize> {

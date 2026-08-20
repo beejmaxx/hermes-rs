@@ -2,8 +2,10 @@
 members = [
     "apps/hermes",
     "crates/domain",
+    "crates/local-tools",
     "crates/ports",
     "crates/protocol",
+    "crates/providers",
     "crates/runtime",
     "crates/testkit",
 ]
@@ -18,15 +20,25 @@ authors = ["Hermes contributors"]
 
 [workspace.dependencies]
 anyhow = "1"
+async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }
+eventsource-stream = "0.2"
 futures-core = "0.3"
 futures-executor = "0.3"
 futures-util = "0.3"
+globset = "0.4"
+ignore = "0.4"
+regex = "1"
+reqwest = { version = "0.13", features = ["json", "stream"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+tempfile = "3"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
+wiremock = "0.6"
 
 [workspace.lints.rust]
 missing_docs = "warn"

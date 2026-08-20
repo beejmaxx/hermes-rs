@@ -112,7 +112,7 @@ where
             messages: request_messages,
             tools: tool_catalog.clone(),
         };
-        let mut attempt = provider.stream(provider_request.clone())?;
+        let mut attempt = provider.stream(provider_request.clone()).await?;
         let attempt_id = attempt.attempt_id.clone();
         provider_requests.push(ProviderRequestRecord {
             attempt_id: attempt_id.clone(),
