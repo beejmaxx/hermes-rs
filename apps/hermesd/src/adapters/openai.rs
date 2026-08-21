@@ -206,16 +206,23 @@ fn normalized_events(
                 emitted_terminal = true;
                 break;
             }
-            if finish_reason.is_some() && !chunk.choices.is_empty() {
+            if chunk.choices.len() > 1 {
                 yield Ok(ProviderEvent::Malformed {
-                    reason: Some("provider_emitted_data_after_finish_reason".into()),
+                    reason: Some("multiple_chat_completion_choices_are_not_supported".into()),
                 });
                 emitted_terminal = true;
                 break;
             }
-            if chunk.choices.len() > 1 {
+            if let Some(completed_reason) = finish_reason.as_deref()
+                && let Some(choice) = chunk.choices.first()
+                && (!choice.delta.is_semantically_empty()
+                    || choice
+                        .finish_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason != completed_reason))
+            {
                 yield Ok(ProviderEvent::Malformed {
-                    reason: Some("multiple_chat_completion_choices_are_not_supported".into()),
+                    reason: Some("provider_emitted_data_after_finish_reason".into()),
                 });
                 emitted_terminal = true;
                 break;
@@ -309,6 +316,15 @@ struct ChunkDelta {
     reasoning: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ChunkToolCall>,
+}
+
+impl ChunkDelta {
+    fn is_semantically_empty(&self) -> bool {
+        self.content.as_deref().is_none_or(str::is_empty)
+            && self.reasoning_content.as_deref().is_none_or(str::is_empty)
+            && self.reasoning.as_deref().is_none_or(str::is_empty)
+            && self.tool_calls.is_empty()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -428,6 +444,92 @@ mod tests {
                 Ok(ProviderEvent::Completed {
                     finish_reason: Some("stop".into()),
                     provider_data: None,
+                }),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepts_repeated_terminal_choice_when_it_only_carries_usage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n",
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let mut provider = OpenAiCompatibleProvider::new(&server.uri(), None)?;
+        let attempt = provider
+            .stream(ChatCompletionsRequest {
+                model: "test-model".into(),
+                messages: vec![ProviderMessage::User { content: "hello".into() }],
+                tools: Vec::new(),
+            })
+            .await?;
+        let events = attempt.events.collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events,
+            vec![
+                Ok(ProviderEvent::MessageStart),
+                Ok(ProviderEvent::TextDelta { text: "hello".into() }),
+                Ok(ProviderEvent::Usage {
+                    prompt_tokens: 3,
+                    completion_tokens: 1,
+                    total_tokens: 4,
+                    cached_tokens: 0,
+                }),
+                Ok(ProviderEvent::Completed {
+                    finish_reason: Some("stop".into()),
+                    provider_data: None,
+                }),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rejects_semantic_data_after_finish_reason() -> Result<(), Box<dyn std::error::Error>> {
+        let server = MockServer::start().await;
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"late mutation\"},\"finish_reason\":null}]}\n\n",
+                    )),
+            )
+            .mount(&server)
+            .await;
+
+        let mut provider = OpenAiCompatibleProvider::new(&server.uri(), None)?;
+        let attempt = provider
+            .stream(ChatCompletionsRequest {
+                model: "test-model".into(),
+                messages: vec![ProviderMessage::User { content: "hello".into() }],
+                tools: Vec::new(),
+            })
+            .await?;
+        let events = attempt.events.collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events,
+            vec![
+                Ok(ProviderEvent::MessageStart),
+                Ok(ProviderEvent::TextDelta { text: "hello".into() }),
+                Ok(ProviderEvent::Malformed {
+                    reason: Some("provider_emitted_data_after_finish_reason".into()),
                 }),
             ]
         );
