@@ -28,7 +28,10 @@ use tokio::{io::AsyncBufReadExt, sync::oneshot, task::JoinHandle};
 
 use super::{
     background::{BackgroundControl, BackgroundSupervisor},
-    chat::{LiveSettings, ObservedTurn, RuntimeArgs, completed_response, execute_turn_observed},
+    chat::{
+        DurableTurnRef, LiveSettings, ObservedTurn, RuntimeArgs, completed_response,
+        execute_turn_observed, persist_worker_binding,
+    },
     state::state_path,
 };
 use crate::adapters::{
@@ -851,12 +854,13 @@ async fn run_session_turn(
         &claim.provider_prompt,
         &scope,
         state,
-        Some(session_id),
+        Some(DurableTurnRef::new(session_id, expected_generation)),
         ObservedTurn::new(&mut observer, approval_control),
     )
     .await?;
-    let final_response = completed_response(&outcome)?.to_owned();
+    let final_response = completed_response(&outcome.contract)?.to_owned();
     let mut appended = outcome
+        .contract
         .semantic_conversation
         .get(previous_len..)
         .ok_or_else(|| {
@@ -871,12 +875,18 @@ async fn run_session_turn(
             _ => anyhow::bail!("runtime did not return a user message for delivered context"),
         }
     }
-    SqliteForegroundTurnStore::open(state)?.complete(
+    let committed = SqliteForegroundTurnStore::open(state)?.complete(
         &claim.spec.turn_id,
         expected_generation,
         &appended,
         terminal_time_ms(claim.started_at_ms),
     )?;
+    persist_worker_binding(
+        state,
+        session_id,
+        committed.owner_generation,
+        outcome.worker_binding.as_ref(),
+    );
     Ok(final_response)
 }
 

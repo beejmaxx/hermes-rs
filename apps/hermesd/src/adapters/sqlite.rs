@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 /// SQLite-backed single-writer durable session repository.
 pub struct SqliteSessionStore {
@@ -150,7 +150,7 @@ impl SqliteSessionStore {
                     )
                     .map_err(storage_error)?;
             }
-            2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION => {}
+            2 | 3 | 4 | 5 | 6 | 7 | SCHEMA_VERSION => {}
             other => {
                 return Err(SessionStoreError::Storage(format!(
                     "unsupported SQLite schema version {other}; expected {SCHEMA_VERSION}"
@@ -296,6 +296,23 @@ impl SqliteSessionStore {
                             '{\"engine\":\"codex_app_server\",\"reasoning_effort\":\"medium\",\"authority_profile\":\"hermes_owned_effects_v1\"}'
                       WHERE provider_adapter = 'codex-app-server';
                      PRAGMA user_version = 7;
+                     COMMIT;",
+                )
+                .map_err(storage_error)?;
+        }
+        if version <= 7 {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     CREATE TABLE worker_bindings (
+                         session_id TEXT PRIMARY KEY NOT NULL,
+                         owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+                         worker_kind TEXT NOT NULL,
+                         binding_json TEXT NOT NULL,
+                         updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                         FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+                     );
+                     PRAGMA user_version = 8;
                      COMMIT;",
                 )
                 .map_err(storage_error)?;

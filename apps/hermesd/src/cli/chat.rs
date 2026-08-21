@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::Context;
 use clap::ValueEnum;
-use domain::{EngineId, LineageId, ManifestDigest, PromptManifest, SessionId};
+use domain::{EngineId, LineageId, ManifestDigest, OwnerGeneration, PromptManifest, SessionId};
 use ports::{SessionStore, SessionStoreError};
 use protocol::{
     AgentTurnRequest, CodexAuthorityProfile, ContractOutcome, EngineConfig, ModelReasoningEffort,
@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 
 use crate::adapters::{
     AgentTools, AgentToolsConfig, ApprovalControl, CodexAppServerCommand, CodexEngineTurnRequest,
-    CodexTurnEngine, OpenAiCompatibleProvider, ReadOnlyLocalTools, SqliteEffectLedger,
-    SqliteSessionStore,
+    CodexTurnEngine, CodexWorkerBinding, OpenAiCompatibleProvider, ReadOnlyLocalTools,
+    SqliteCodexBindingStore, SqliteEffectLedger, SqliteSessionStore,
 };
 use crate::cli::state::state_path;
 
@@ -176,7 +176,7 @@ async fn run_ephemeral_chat(
     let scope = live_execution_scope()?;
     let state = state_path(state_override)?;
     let outcome = execute_turn(&settings, Vec::new(), prompt, &scope, &state, None).await?;
-    println!("{}", completed_response(&outcome)?);
+    println!("{}", completed_response(&outcome.contract)?);
     Ok(())
 }
 
@@ -211,16 +211,47 @@ async fn run_durable_chat(
     let session_id = snapshot.config.session_id.clone();
     let generation = snapshot.owner_generation;
     let previous_len = snapshot.conversation.len();
-    let outcome =
-        execute_turn(&settings, snapshot.conversation, prompt, &scope, &state, Some(&session_id))
-            .await?;
-    let response = completed_response(&outcome)?.to_owned();
-    let appended = outcome.semantic_conversation.get(previous_len..).ok_or_else(|| {
+    let outcome = execute_turn(
+        &settings,
+        snapshot.conversation,
+        prompt,
+        &scope,
+        &state,
+        Some(DurableTurnRef::new(&session_id, generation)),
+    )
+    .await?;
+    let response = completed_response(&outcome.contract)?.to_owned();
+    let appended = outcome.contract.semantic_conversation.get(previous_len..).ok_or_else(|| {
         anyhow::anyhow!("runtime returned a conversation shorter than its durable prefix")
     })?;
-    store.append(&session_id, generation, appended)?;
+    let committed = store.append(&session_id, generation, appended)?;
+    persist_worker_binding(
+        &state,
+        &session_id,
+        committed.owner_generation,
+        outcome.worker_binding.as_ref(),
+    );
     println!("{response}");
     Ok(())
+}
+
+/// Engine-neutral result plus optional derived external-worker continuity state.
+pub(super) struct LiveTurnOutcome {
+    pub(super) contract: ContractOutcome,
+    pub(super) worker_binding: Option<CodexWorkerBinding>,
+}
+
+/// Canonical session authority paired for one durable engine execution.
+#[derive(Clone, Copy)]
+pub(super) struct DurableTurnRef<'a> {
+    session_id: &'a SessionId,
+    generation: OwnerGeneration,
+}
+
+impl<'a> DurableTurnRef<'a> {
+    pub(super) const fn new(session_id: &'a SessionId, generation: OwnerGeneration) -> Self {
+        Self { session_id, generation }
+    }
 }
 
 pub(super) async fn execute_turn(
@@ -229,15 +260,15 @@ pub(super) async fn execute_turn(
     prompt: &str,
     scope: &str,
     state: &Path,
-    session_id: Option<&SessionId>,
-) -> anyhow::Result<ContractOutcome> {
+    durable: Option<DurableTurnRef<'_>>,
+) -> anyhow::Result<LiveTurnOutcome> {
     execute_turn_inner(
         settings,
         semantic_history,
         prompt,
         scope,
         state,
-        session_id,
+        durable,
         TurnHooks { observer: None, approval_control: None },
     )
     .await
@@ -264,16 +295,16 @@ pub(super) async fn execute_turn_observed(
     prompt: &str,
     scope: &str,
     state: &Path,
-    session_id: Option<&SessionId>,
+    durable: Option<DurableTurnRef<'_>>,
     observed: ObservedTurn<'_>,
-) -> anyhow::Result<ContractOutcome> {
+) -> anyhow::Result<LiveTurnOutcome> {
     execute_turn_inner(
         settings,
         semantic_history,
         prompt,
         scope,
         state,
-        session_id,
+        durable,
         TurnHooks {
             observer: Some(observed.observer),
             approval_control: Some(observed.approval_control),
@@ -288,9 +319,10 @@ async fn execute_turn_inner(
     prompt: &str,
     scope: &str,
     state: &Path,
-    session_id: Option<&SessionId>,
+    durable: Option<DurableTurnRef<'_>>,
     hooks: TurnHooks<'_>,
-) -> anyhow::Result<ContractOutcome> {
+) -> anyhow::Result<LiveTurnOutcome> {
+    let session_id = durable.map(|authority| authority.session_id);
     let TurnHooks { observer, approval_control } = hooks;
     let api_key = match settings.engine {
         EnginePreset::Direct => read_api_key(settings.api_key_env.as_deref())?,
@@ -344,11 +376,13 @@ async fn execute_turn_inner(
                 Some(observer) => {
                     runtime::run_turn_observed(request, &mut provider, &mut tools, observer)
                         .await
+                        .map(|contract| LiveTurnOutcome { contract, worker_binding: None })
                         .map_err(Into::into)
                 }
-                None => {
-                    runtime::run_turn(request, &mut provider, &mut tools).await.map_err(Into::into)
-                }
+                None => runtime::run_turn(request, &mut provider, &mut tools)
+                    .await
+                    .map(|contract| LiveTurnOutcome { contract, worker_binding: None })
+                    .map_err(Into::into),
             }
         }
         EnginePreset::Codex => {
@@ -373,22 +407,75 @@ async fn execute_turn_inner(
                 prompt: prompt.into(),
                 client_user_message_id: Some(scope.into()),
             };
+            let previous_binding = match durable {
+                Some(authority) => SqliteCodexBindingStore::open(state)?
+                    .load_current(authority.session_id, authority.generation)?,
+                None => None,
+            };
             match observer {
-                Some(observer) => engine
-                    .run_new(request, &settings.tools, &mut tools, observer)
-                    .await
-                    .map(|outcome| outcome.contract)
-                    .map_err(Into::into),
+                Some(observer) => {
+                    let result = if session_id.is_some() {
+                        engine
+                            .run_bound(
+                                request,
+                                previous_binding.as_ref(),
+                                &settings.tools,
+                                &mut tools,
+                                observer,
+                            )
+                            .await
+                    } else {
+                        engine.run_new(request, &settings.tools, &mut tools, observer).await
+                    };
+                    result
+                        .map(|outcome| LiveTurnOutcome {
+                            contract: outcome.contract,
+                            worker_binding: Some(outcome.binding),
+                        })
+                        .map_err(Into::into)
+                }
                 None => {
                     let mut observer = runtime::NoopEventObserver;
-                    engine
-                        .run_new(request, &settings.tools, &mut tools, &mut observer)
-                        .await
-                        .map(|outcome| outcome.contract)
+                    let result = if session_id.is_some() {
+                        engine
+                            .run_bound(
+                                request,
+                                previous_binding.as_ref(),
+                                &settings.tools,
+                                &mut tools,
+                                &mut observer,
+                            )
+                            .await
+                    } else {
+                        engine.run_new(request, &settings.tools, &mut tools, &mut observer).await
+                    };
+                    result
+                        .map(|outcome| LiveTurnOutcome {
+                            contract: outcome.contract,
+                            worker_binding: Some(outcome.binding),
+                        })
                         .map_err(Into::into)
                 }
             }
         }
+    }
+}
+
+pub(super) fn persist_worker_binding(
+    state: &Path,
+    session_id: &SessionId,
+    generation: OwnerGeneration,
+    binding: Option<&CodexWorkerBinding>,
+) {
+    let Some(binding) = binding else {
+        return;
+    };
+    let result = SqliteCodexBindingStore::open(state)
+        .and_then(|mut store| store.save(session_id, generation, binding));
+    if let Err(error) = result {
+        eprintln!(
+            "warning: canonical Hermes turn committed, but derived Codex binding was not saved: {error}"
+        );
     }
 }
 

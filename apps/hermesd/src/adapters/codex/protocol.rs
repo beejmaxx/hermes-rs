@@ -380,6 +380,101 @@ impl CodexThreadResumeParams {
     }
 }
 
+/// Parameters used to branch from the last worker turn committed by Hermes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexThreadForkParams {
+    thread_id: String,
+    last_turn_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_policy: Option<CodexApprovalPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox: Option<CodexSandboxMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<BTreeMap<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    developer_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ephemeral: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    exclude_turns: bool,
+}
+
+impl CodexThreadForkParams {
+    /// Fork through the identified completed turn, excluding any later worker state.
+    #[must_use]
+    pub fn through_turn(thread_id: impl Into<String>, last_turn_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            last_turn_id: last_turn_id.into(),
+            model: None,
+            model_provider: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            config: None,
+            developer_instructions: None,
+            ephemeral: false,
+            exclude_turns: true,
+        }
+    }
+
+    /// Preserve the immutable model selected by the Hermes session.
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Preserve the worker provider adapter recorded by the committed binding.
+    #[must_use]
+    pub fn with_model_provider(mut self, provider: impl Into<String>) -> Self {
+        self.model_provider = Some(provider.into());
+        self
+    }
+
+    /// Preserve the immutable workspace selected by the Hermes session.
+    #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Deny worker-owned approval escalation on the fork.
+    #[must_use]
+    pub const fn with_approval_policy(mut self, policy: CodexApprovalPolicy) -> Self {
+        self.approval_policy = Some(policy);
+        self
+    }
+
+    /// Retain the defense-in-depth worker sandbox on the fork.
+    #[must_use]
+    pub const fn with_sandbox(mut self, sandbox: CodexSandboxMode) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// Reapply explicit authority and model configuration to the fork.
+    #[must_use]
+    pub fn with_config(mut self, config: BTreeMap<String, Value>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Reapply the immutable Hermes developer instructions to the fork.
+    #[must_use]
+    pub fn with_developer_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.developer_instructions = Some(instructions.into());
+        self
+    }
+}
+
 /// Minimal opaque Codex thread identity returned to the Hermes binding layer.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub struct CodexThread {

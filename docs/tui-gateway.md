@@ -137,6 +137,9 @@ transcript. Background delegation remains disabled for this engine until child
 turns can inherit the selected cognitive engine safely. The reasoning effort
 and versioned authority profile are frozen when the session is created;
 resuming it cannot silently inherit a changed user-level Codex configuration.
+The first durable turn creates a persistent Codex thread. Later turns fork
+through the last worker turn represented by the committed Hermes generation,
+which retains worker context without admitting an uncommitted crash tail.
 
 It writes protocol frames—not a human interface—to stdout and reserves stderr
 for diagnostics. A normal user should launch it through a compatible client.
@@ -199,9 +202,8 @@ This is a usable vertical slice, not a claim of full gateway parity:
   per-call terminal `once`/`deny`, not session or permanent policies.
 - Background-child steering, nested delegation, and replay of an ambiguous
   child outcome are not implemented.
-- Codex-backed turns currently use a fresh ephemeral app-server thread and a
-  bounded semantic-history projection. Persistent Codex thread binding/resume
-  and graceful app-server interruption are not implemented yet.
+- Codex worker bindings are durable and crash-fenced, but graceful app-server
+  interruption is not implemented yet.
 
 Unsupported methods return JSON-RPC `-32601`; the gateway does not silently
 pretend that a capability exists. These gaps define follow-up behavior slices

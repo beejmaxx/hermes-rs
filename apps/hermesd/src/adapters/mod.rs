@@ -6,6 +6,7 @@ mod codex;
 mod local_tools;
 mod openai;
 mod sqlite;
+mod sqlite_codex_binding;
 mod sqlite_delegation;
 mod sqlite_foreground;
 mod terminal;
@@ -20,14 +21,16 @@ pub use codex::{
     CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec, CodexDynamicToolSpec,
     CodexEngineError, CodexEngineOutcome, CodexEngineTurnRequest, CodexInitializeParams,
     CodexInitializeResponse, CodexNotification, CodexRequestId, CodexSandboxMode,
-    CodexServerRequest, CodexThread, CodexThreadOpenResponse, CodexThreadResumeParams,
-    CodexThreadStartParams, CodexTurn, CodexTurnCompleted, CodexTurnEngine,
-    CodexTurnInterruptParams, CodexTurnSandboxPolicy, CodexTurnStartParams, CodexTurnStartResponse,
-    CodexTurnStarted, CodexTurnStatus, CodexWorkerBinding, dynamic_tools_from_catalog,
+    CodexServerRequest, CodexThread, CodexThreadForkParams, CodexThreadOpenResponse,
+    CodexThreadResumeParams, CodexThreadStartParams, CodexTurn, CodexTurnCompleted,
+    CodexTurnEngine, CodexTurnInterruptParams, CodexTurnSandboxPolicy, CodexTurnStartParams,
+    CodexTurnStartResponse, CodexTurnStarted, CodexTurnStatus, CodexWorkerBinding,
+    dynamic_tools_from_catalog,
 };
 pub use local_tools::{LocalToolsConfigError, ReadOnlyLocalTools};
 pub use openai::{OpenAiCompatibleProvider, OpenAiProviderConfigError};
 pub use sqlite::{SqliteEffectLedger, SqliteSessionStore};
+pub use sqlite_codex_binding::SqliteCodexBindingStore;
 pub use sqlite_delegation::SqliteDelegationStore;
 pub use sqlite_foreground::SqliteForegroundTurnStore;
 pub use terminal::TerminalTool;

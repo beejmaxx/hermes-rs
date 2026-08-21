@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
@@ -39,9 +39,10 @@ pub enum CodexAuthorityError {
 }
 
 /// Frozen evidence of the capabilities granted to one Codex worker thread.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodexAuthorityManifest {
-    worker: &'static str,
+    worker: String,
     dynamic_tools: Vec<String>,
     disabled_mcp_servers: Vec<String>,
     ambient_environments: bool,
@@ -85,7 +86,7 @@ impl CodexAuthorityPolicy {
         let disabled_mcp_servers = effective_mcp_server_names(effective)?;
         let config_overrides = authority_overrides(&disabled_mcp_servers);
         let manifest = CodexAuthorityManifest {
-            worker: "codex-app-server",
+            worker: "codex-app-server".into(),
             dynamic_tools: tool_names,
             disabled_mcp_servers,
             ambient_environments: false,
@@ -99,6 +100,13 @@ impl CodexAuthorityPolicy {
         Ok(Self { config_overrides, dynamic_tools, manifest })
     }
 
+    /// Freeze a worker configuration value alongside the authority restrictions.
+    #[must_use]
+    pub fn with_config_override(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.config_overrides.insert(key.into(), value);
+        self
+    }
+
     /// Apply the frozen restrictions and client-hosted catalog to a thread request.
     #[must_use]
     pub fn constrain(&self, params: CodexThreadStartParams) -> CodexThreadStartParams {
@@ -106,6 +114,12 @@ impl CodexAuthorityPolicy {
             .with_config(self.config_overrides.clone())
             .with_dynamic_tools(self.dynamic_tools.clone())
             .without_environments()
+    }
+
+    /// Configuration overrides shared by new and safely forked worker threads.
+    #[must_use]
+    pub fn config_overrides(&self) -> BTreeMap<String, Value> {
+        self.config_overrides.clone()
     }
 
     /// Capability evidence to persist beside the worker binding.

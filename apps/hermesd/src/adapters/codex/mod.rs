@@ -23,10 +23,10 @@ pub use protocol::{
     CodexConfigReadResponse, CodexDynamicToolCallOutputContentItem, CodexDynamicToolCallParams,
     CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec, CodexDynamicToolSpec,
     CodexInitializeParams, CodexInitializeResponse, CodexNotification, CodexRequestId,
-    CodexSandboxMode, CodexServerRequest, CodexThread, CodexThreadOpenResponse,
-    CodexThreadResumeParams, CodexThreadStartParams, CodexTurn, CodexTurnCompleted,
-    CodexTurnInterruptParams, CodexTurnSandboxPolicy, CodexTurnStartParams, CodexTurnStartResponse,
-    CodexTurnStarted, CodexTurnStatus,
+    CodexSandboxMode, CodexServerRequest, CodexThread, CodexThreadForkParams,
+    CodexThreadOpenResponse, CodexThreadResumeParams, CodexThreadStartParams, CodexTurn,
+    CodexTurnCompleted, CodexTurnInterruptParams, CodexTurnSandboxPolicy, CodexTurnStartParams,
+    CodexTurnStartResponse, CodexTurnStarted, CodexTurnStatus,
 };
 use protocol::{
     InboundMessage, OutboundErrorResponse, OutboundNotification, OutboundRequest, OutboundResponse,
@@ -227,6 +227,14 @@ impl CodexAppServer {
         params: &CodexThreadResumeParams,
     ) -> Result<CodexThreadOpenResponse, CodexAppServerError> {
         self.request("thread/resume", params).await
+    }
+
+    /// Branch from the exact worker turn represented by a committed Hermes generation.
+    pub async fn fork_thread(
+        &mut self,
+        params: &CodexThreadForkParams,
+    ) -> Result<CodexThreadOpenResponse, CodexAppServerError> {
+        self.request("thread/fork", params).await
     }
 
     /// Submit one turn to an opened worker thread.

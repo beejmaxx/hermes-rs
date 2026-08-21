@@ -113,12 +113,13 @@ immutable session engine configuration, so a later process cannot change model
 behavior by inheriting a different user-level Codex configuration.
 
 The CLI and stdio gateway can select this engine explicitly. The current host
-still opens one ephemeral worker thread per turn; for later turns it projects
-the canonical Hermes transcript into a fresh worker input while stripping
-provider replay, execution identities, and hidden reasoning. Durable worker
-bindings, native Codex thread resume, and graceful interrupt propagation remain
-host-integration work; the adapter does not pretend those lifecycle semantics
-are complete.
+uses an ephemeral worker thread for stateless chat. A durable session persists
+the Codex thread and last completed turn as a derived binding fenced by the
+canonical Hermes generation. Each later turn uses Codex `thread/fork` through
+that exact turn, so worker activity after the committed boundary is omitted.
+If binding persistence fails, the next turn rebuilds from the canonical Hermes
+transcript instead of treating stale worker state as truth. Graceful interrupt
+propagation remains host-integration work.
 
 The durable proof currently covers:
 

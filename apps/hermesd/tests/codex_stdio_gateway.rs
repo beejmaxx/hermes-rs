@@ -10,7 +10,7 @@ use std::{
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
 };
 
-use hermesd::adapters::{SqliteEffectLedger, SqliteSessionStore};
+use hermesd::adapters::{SqliteCodexBindingStore, SqliteEffectLedger, SqliteSessionStore};
 use ports::{EffectLedger, SessionStore};
 use protocol::{CodexAuthorityProfile, EngineConfig, ModelReasoningEffort, TransportKind};
 use serde_json::{Value, json};
@@ -127,6 +127,11 @@ async fn codex_gateway_uses_terminal_approval_persists_and_projects_history()
     );
     assert_eq!(snapshot.owner_generation.get(), 3);
     assert_eq!(snapshot.conversation.len(), 6);
+    let binding = SqliteCodexBindingStore::open(&database)?
+        .load_current(&session_id, snapshot.owner_generation)?
+        .ok_or("committed Codex binding was not persisted")?;
+    assert_eq!(binding.thread_id, "thread-2");
+    assert_eq!(binding.last_turn_id, "turn-2");
     assert!(SqliteEffectLedger::open(&database)?.pending()?.is_empty());
     assert_eq!(fs::read_to_string(counter)?, "2\n");
     Ok(())
@@ -341,11 +346,21 @@ require_text '"method":"config/read"'
 emit '{{"id":2,"result":{{"config":{{"mcp_servers":{{"ambient.docs":{{"command":"docs"}}}}}},"origins":{{}},"layers":null}}}}'
 
 read_frame
-require_text '"method":"thread/start"'
-require_text '"environments":[]'
+if [ "$count" -eq 1 ]; then
+  require_text '"method":"thread/start"'
+  require_text '"ephemeral":false'
+  require_text '"environments":[]'
+  require_text '"name":"terminal"'
+  reject_text '"name":"delegate_task"'
+else
+  require_text '"method":"thread/fork"'
+  require_text '"threadId":"thread-1"'
+  require_text '"lastTurnId":"turn-1"'
+  require_text '"modelProvider":"openai_http"'
+  require_text '"excludeTurns":true'
+fi
 require_text '"mcp_servers":{{"ambient.docs":{{"enabled":false}}}}'
-require_text '"name":"terminal"'
-reject_text '"name":"delegate_task"'
+require_text '"model_reasoning_effort":"low"'
 emit "{{\"method\":\"thread/started\",\"params\":{{\"thread\":{{\"id\":\"$thread_id\"}}}}}}"
 emit "{{\"id\":3,\"result\":{{\"thread\":{{\"id\":\"$thread_id\"}},\"model\":\"gpt-5.6-luna\",\"modelProvider\":\"openai_http\",\"cwd\":\"{cwd}\",\"approvalPolicy\":\"never\",\"sandbox\":{{\"type\":\"readOnly\"}}}}}}"
 
@@ -358,9 +373,9 @@ require_text '"effort":"low"'
 if [ "$count" -eq 1 ]; then
   require_text 'create the approved marker'
 else
-  require_text 'Hermes is starting a fresh cognitive worker'
   require_text 'what happened?'
-  require_text 'The approved marker was created.'
+  reject_text 'Hermes is starting a fresh cognitive worker'
+  reject_text 'The approved marker was created.'
 fi
 emit "{{\"method\":\"turn/started\",\"params\":{{\"threadId\":\"$thread_id\",\"turn\":{{\"id\":\"$turn_id\",\"status\":\"inProgress\",\"items\":[]}}}}}}"
 emit "{{\"id\":4,\"result\":{{\"turn\":{{\"id\":\"$turn_id\",\"status\":\"inProgress\",\"items\":[]}}}}}}"

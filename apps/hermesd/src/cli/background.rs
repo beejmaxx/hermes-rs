@@ -13,13 +13,16 @@ use domain::{
     OwnerGeneration,
 };
 use ports::{DelegationStore, SessionStore};
-use protocol::{ContractOutcome, DelegationSnapshot};
+use protocol::DelegationSnapshot;
 use tokio::{
     sync::oneshot,
     task::{JoinHandle, JoinSet},
 };
 
-use super::chat::{LiveSettings, completed_response, execute_turn};
+use super::chat::{
+    DurableTurnRef, LiveSettings, LiveTurnOutcome, completed_response, execute_turn,
+    persist_worker_binding,
+};
 use crate::adapters::{SqliteDelegationStore, SqliteSessionStore};
 
 const SUPERVISOR_INTERVAL: Duration = Duration::from_millis(50);
@@ -177,14 +180,14 @@ async fn execute_claim(
         CHILD_PROMPT,
         &scope,
         &state,
-        Some(&child_session_id),
+        Some(DurableTurnRef::new(&child_session_id, child_generation)),
     ));
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.tick().await;
     let mut cancellation_poll = tokio::time::interval(CANCELLATION_POLL_INTERVAL);
     let exit = loop {
         tokio::select! {
-            outcome = &mut execution => break ChildExit::Outcome(outcome),
+            outcome = &mut execution => break ChildExit::Outcome(Box::new(outcome)),
             cancellation = &mut cancel_receiver => {
                 if let Ok(reason) = cancellation {
                     break ChildExit::Cancelled(reason);
@@ -217,7 +220,7 @@ async fn execute_claim(
 }
 
 enum ChildExit {
-    Outcome(anyhow::Result<ContractOutcome>),
+    Outcome(Box<anyhow::Result<LiveTurnOutcome>>),
     Cancelled(String),
 }
 
@@ -242,7 +245,7 @@ fn finish_execution(
             )?;
             return Ok(());
         }
-        ChildExit::Outcome(outcome) => outcome,
+        ChildExit::Outcome(outcome) => *outcome,
     };
     if let Some(reason) = cancellation_reason(&store.load(&claim.spec.delegation_id)?) {
         store.finish(
@@ -255,20 +258,25 @@ fn finish_execution(
         return Ok(());
     }
     let completed = outcome.and_then(|outcome| {
-        let summary = completed_response(&outcome)?.to_owned();
+        let summary = completed_response(&outcome.contract)?.to_owned();
         Ok((outcome, summary))
     });
+    let mut committed_binding = None;
     let result = match completed {
-        Ok((outcome, summary)) => store
-            .complete_child(
+        Ok((outcome, summary)) => {
+            let result = store.complete_child(
                 &claim.spec.delegation_id,
                 DelegationAuthority { owner_generation: delegation_generation, fencing_token },
                 child_generation,
-                &outcome.semantic_conversation,
+                &outcome.contract.semantic_conversation,
                 summary,
                 completed_at_ms,
-            )
-            .map(|_| ()),
+            );
+            if result.is_ok() {
+                committed_binding = outcome.worker_binding;
+            }
+            result.map(|_| ())
+        }
         Err(error) => store
             .finish(
                 &claim.spec.delegation_id,
@@ -292,6 +300,21 @@ fn finish_execution(
             )?;
         } else {
             return Err(error.into());
+        }
+    }
+    if let Some(binding) = committed_binding {
+        match SqliteSessionStore::open(state)
+            .and_then(|mut sessions| sessions.load(&claim.spec.child_session_id))
+        {
+            Ok(snapshot) => persist_worker_binding(
+                state,
+                &claim.spec.child_session_id,
+                snapshot.owner_generation,
+                Some(&binding),
+            ),
+            Err(error) => eprintln!(
+                "warning: canonical child turn committed, but its Codex binding generation could not be loaded: {error}"
+            ),
         }
     }
     Ok(())

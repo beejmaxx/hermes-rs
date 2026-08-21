@@ -127,6 +127,7 @@ fi
         .await?;
 
     assert_eq!(outcome.binding.thread_id, "thread-authority");
+    assert_eq!(outcome.binding.last_turn_id, "turn-authority");
     assert_eq!(outcome.binding.worker_user_agent, "fake-codex/engine-test");
     assert_eq!(outcome.binding.model_provider, "openai_http");
     assert_eq!(outcome.binding.authority.dynamic_tools(), ["read_file", "search_files"]);

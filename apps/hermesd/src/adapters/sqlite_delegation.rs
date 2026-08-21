@@ -1695,6 +1695,7 @@ mod tests {
         let connection = Connection::open(&database)?;
         connection.execute_batch(
             "ALTER TABLE sessions DROP COLUMN engine_config_json;
+             DROP TABLE worker_bindings;
              DROP TABLE foreground_turns;
              DROP TABLE delegation_completions;
              DROP TABLE delegations;
@@ -1709,13 +1710,13 @@ mod tests {
         let table_count = connection.query_row(
             "SELECT count(*) FROM sqlite_master
              WHERE type = 'table' AND name IN (
-                 'delegations', 'delegation_completions', 'foreground_turns'
+                 'delegations', 'delegation_completions', 'foreground_turns', 'worker_bindings'
              )",
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(version, 7);
-        assert_eq!(table_count, 3);
+        assert_eq!(version, 8);
+        assert_eq!(table_count, 4);
 
         let mut sessions = SqliteSessionStore::open(&database)?;
         assert_eq!(sessions.load(&SessionId::new("existing")?)?.config.model, "test-model");

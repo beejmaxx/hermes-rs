@@ -9,7 +9,7 @@ use domain::{
 use ports::ToolBroker;
 use protocol::{ContractOutcome, TerminalOutcome, TerminalStatus, Usage};
 use runtime::{RuntimeError, RuntimeEventObserver, RuntimeEventObserverError, ToolHost};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -18,7 +18,7 @@ use super::{
     CodexApprovalPolicy, CodexAuthorityError, CodexAuthorityManifest, CodexAuthorityPolicy,
     CodexConfigReadParams, CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec,
     CodexDynamicToolSpec, CodexInitializeParams, CodexNotification, CodexSandboxMode,
-    CodexThreadStartParams, CodexTurnStartParams, CodexTurnStatus,
+    CodexThreadForkParams, CodexThreadStartParams, CodexTurnStartParams, CodexTurnStatus,
 };
 
 /// A Codex turn could not complete inside the Hermes authority boundary.
@@ -100,6 +100,38 @@ impl CodexTurnEngine {
         T: ToolBroker + ?Sized,
         O: RuntimeEventObserver + ?Sized,
     {
+        self.run_inner(request, None, false, tool_catalog, tools, observer).await
+    }
+
+    /// Execute a durable turn, branching from the last worker turn committed by Hermes.
+    pub async fn run_bound<T, O>(
+        &self,
+        request: CodexEngineTurnRequest,
+        previous_binding: Option<&CodexWorkerBinding>,
+        tool_catalog: &[Value],
+        tools: &mut T,
+        observer: &mut O,
+    ) -> Result<CodexEngineOutcome, CodexEngineError>
+    where
+        T: ToolBroker + ?Sized,
+        O: RuntimeEventObserver + ?Sized,
+    {
+        self.run_inner(request, previous_binding, true, tool_catalog, tools, observer).await
+    }
+
+    async fn run_inner<T, O>(
+        &self,
+        request: CodexEngineTurnRequest,
+        previous_binding: Option<&CodexWorkerBinding>,
+        persist_worker_thread: bool,
+        tool_catalog: &[Value],
+        tools: &mut T,
+        observer: &mut O,
+    ) -> Result<CodexEngineOutcome, CodexEngineError>
+    where
+        T: ToolBroker + ?Sized,
+        O: RuntimeEventObserver + ?Sized,
+    {
         request.validate()?;
         let dynamic_tools = dynamic_tools_from_catalog(tool_catalog)?;
         let allowed_tools =
@@ -117,33 +149,63 @@ impl CodexTurnEngine {
             .await?;
         worker.initialized().await?;
         let effective = worker.read_config(&CodexConfigReadParams::for_cwd(cwd)).await?;
-        let policy = CodexAuthorityPolicy::new(&effective, dynamic_tools)?;
-        let opened = worker
-            .start_thread(
-                &policy.constrain(
-                    CodexThreadStartParams::new()
+        let mut policy = CodexAuthorityPolicy::new(&effective, dynamic_tools)?;
+        if let Some(effort) = &self.effort {
+            policy = policy.with_config_override("model_reasoning_effort", json!(effort));
+        }
+        if let Some(binding) = previous_binding
+            && binding.authority.dynamic_tools() != policy.manifest().dynamic_tools()
+        {
+            return Err(CodexEngineError::Invalid(
+                "committed worker binding has a different dynamic-tool catalog".into(),
+            ));
+        }
+        let (opened, worker_input) = match previous_binding {
+            Some(binding) => {
+                let params =
+                    CodexThreadForkParams::through_turn(&binding.thread_id, &binding.last_turn_id)
                         .with_model(&self.model)
+                        .with_model_provider(&binding.model_provider)
                         .with_cwd(&self.cwd)
                         .with_approval_policy(CodexApprovalPolicy::Never)
                         .with_sandbox(CodexSandboxMode::ReadOnly)
-                        .with_developer_instructions(&self.developer_instructions)
-                        .with_ephemeral(true),
-                ),
-            )
-            .await?;
+                        .with_config(policy.config_overrides())
+                        .with_developer_instructions(&self.developer_instructions);
+                (worker.fork_thread(&params).await?, request.prompt.clone())
+            }
+            None => {
+                let opened = worker
+                    .start_thread(
+                        &policy.constrain(
+                            CodexThreadStartParams::new()
+                                .with_model(&self.model)
+                                .with_cwd(&self.cwd)
+                                .with_approval_policy(CodexApprovalPolicy::Never)
+                                .with_sandbox(CodexSandboxMode::ReadOnly)
+                                .with_developer_instructions(&self.developer_instructions)
+                                .with_ephemeral(!persist_worker_thread),
+                        ),
+                    )
+                    .await?;
+                let worker_input =
+                    project_worker_input(&request.semantic_history, &request.prompt)?;
+                (opened, worker_input)
+            }
+        };
         if opened.model() != self.model || opened.cwd() != self.cwd {
             return Err(CodexEngineError::Invalid(
                 "worker did not preserve the frozen model and cwd".into(),
             ));
         }
-        let binding = CodexWorkerBinding {
-            thread_id: opened.thread().id().to_owned(),
-            worker_user_agent: initialized.user_agent().to_owned(),
-            model_provider: opened.model_provider().to_owned(),
-            authority: policy.manifest().clone(),
-        };
-        let worker_input = project_worker_input(&request.semantic_history, &request.prompt)?;
-        let mut turn_params = CodexTurnStartParams::text(&binding.thread_id, worker_input)
+        if let Some(binding) = previous_binding
+            && opened.model_provider() != binding.model_provider
+        {
+            return Err(CodexEngineError::Invalid(
+                "worker did not preserve the committed model provider".into(),
+            ));
+        }
+        let thread_id = opened.thread().id().to_owned();
+        let mut turn_params = CodexTurnStartParams::text(&thread_id, worker_input)
             .without_environments()
             .with_approval_policy(CodexApprovalPolicy::Never)
             .with_sandbox_policy(super::CodexTurnSandboxPolicy::hermes_read_only())
@@ -156,6 +218,13 @@ impl CodexTurnEngine {
         }
         let started = worker.start_turn(&turn_params).await?;
         let turn_id = started.turn().id().to_owned();
+        let binding = CodexWorkerBinding {
+            thread_id,
+            last_turn_id: turn_id.clone(),
+            worker_user_agent: initialized.user_agent().to_owned(),
+            model_provider: opened.model_provider().to_owned(),
+            authority: policy.manifest().clone(),
+        };
         if started.turn().status() != CodexTurnStatus::InProgress {
             return Err(CodexEngineError::Invalid(
                 "worker returned a non-running turn from turn/start".into(),
@@ -514,10 +583,13 @@ impl CodexEngineTurnRequest {
 }
 
 /// Opaque worker attachment and frozen capability evidence returned to the Hermes host.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodexWorkerBinding {
     /// Worker-owned thread identity related to the Hermes session by the host.
     pub thread_id: String,
+    /// Last worker turn known to be represented by the corresponding Hermes generation.
+    pub last_turn_id: String,
     /// Worker build identity returned during initialization.
     pub worker_user_agent: String,
     /// Effective model-provider adapter selected inside Codex.
