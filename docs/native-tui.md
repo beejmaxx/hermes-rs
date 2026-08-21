@@ -91,3 +91,23 @@ PTY-level process test creates a session, submits a turn, renders a terminal
 approval, denies it, verifies the command did not run, reloads the committed
 transcript, exits, starts an entirely new TUI and gateway process, and resumes
 the same kernel-owned history.
+
+## Real dogfood result
+
+The client was also exercised against the locally authenticated Codex app
+server rather than a fake worker:
+
+- A running turn was interrupted from the TUI. The worker stopped and the
+  canonical session remained resumable without an uncommitted binding.
+- A subsequent turn streamed to completion and was reconstructed from the
+  canonical transcript.
+- Codex proposed an exact terminal command through the Hermes-hosted dynamic
+  tool. The TUI rendered the command and denied it; the target file was absent
+  and the effect ledger had no pending entry afterward.
+- A fresh TUI and gateway process listed the four committed messages and
+  resumed the same transcript from SQLite.
+
+Dogfooding exposed two client integration defects, both fixed in the first
+milestone: long drafts now scroll and clamp the terminal cursor, and the frozen
+Codex prompt now distinguishes its read-only worker sandbox from an approved
+Hermes-hosted terminal action. No new protocol object was needed.
