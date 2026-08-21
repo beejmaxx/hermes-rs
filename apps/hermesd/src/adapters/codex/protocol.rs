@@ -1,6 +1,6 @@
 //! Typed subset of the Codex app-server protocol used by the supervised worker.
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,6 +135,10 @@ pub struct CodexThreadStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     developer_instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    config: Option<BTreeMap<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dynamic_tools: Option<Vec<CodexDynamicToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ephemeral: Option<bool>,
 }
 
@@ -187,10 +191,67 @@ impl CodexThreadStartParams {
         self
     }
 
+    /// Apply explicit per-thread configuration overrides.
+    #[must_use]
+    pub fn with_config(mut self, config: BTreeMap<String, Value>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// Expose only the client-hosted dynamic tools selected for this thread.
+    #[must_use]
+    pub fn with_dynamic_tools(mut self, tools: Vec<CodexDynamicToolSpec>) -> Self {
+        self.dynamic_tools = Some(tools);
+        self
+    }
+
     /// Control whether Codex persists the new thread in its own store.
     #[must_use]
     pub const fn with_ephemeral(mut self, ephemeral: bool) -> Self {
         self.ephemeral = Some(ephemeral);
+        self
+    }
+}
+
+/// Client-hosted tool specification accepted by Codex app-server.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CodexDynamicToolSpec {
+    /// One standalone function implemented by the Hermes host.
+    Function(CodexDynamicToolFunctionSpec),
+}
+
+/// Schema and model-facing documentation for one client-hosted function.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexDynamicToolFunctionSpec {
+    name: String,
+    description: String,
+    input_schema: Value,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    defer_loading: bool,
+}
+
+impl CodexDynamicToolFunctionSpec {
+    /// Define one eagerly visible client-hosted function.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+            defer_loading: false,
+        }
+    }
+
+    /// Defer loading this tool until the worker's own discovery flow selects it.
+    #[must_use]
+    pub const fn with_deferred_loading(mut self, defer_loading: bool) -> Self {
+        self.defer_loading = defer_loading;
         self
     }
 }
@@ -563,12 +624,96 @@ pub enum CodexNotification {
     },
 }
 
+/// Typed parameters for a client-hosted dynamic-tool request.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexDynamicToolCallParams {
+    thread_id: String,
+    turn_id: String,
+    call_id: String,
+    #[serde(default)]
+    namespace: Option<String>,
+    tool: String,
+    arguments: Value,
+}
+
+impl CodexDynamicToolCallParams {
+    /// Worker thread requesting the call.
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    /// Worker turn requesting the call.
+    #[must_use]
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    /// Worker correlation identity for this call.
+    #[must_use]
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    /// Optional dynamic-tool namespace.
+    #[must_use]
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+
+    /// Client-hosted tool name requested by the worker.
+    #[must_use]
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    /// JSON arguments proposed by the worker.
+    #[must_use]
+    pub const fn arguments(&self) -> &Value {
+        &self.arguments
+    }
+}
+
+/// Result returned by Hermes after executing a client-hosted dynamic tool.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexDynamicToolCallResponse {
+    content_items: Vec<CodexDynamicToolCallOutputContentItem>,
+    success: bool,
+}
+
+impl CodexDynamicToolCallResponse {
+    /// Return one text result and an explicit success disposition.
+    #[must_use]
+    pub fn text(text: impl Into<String>, success: bool) -> Self {
+        Self {
+            content_items: vec![CodexDynamicToolCallOutputContentItem::InputText {
+                text: text.into(),
+            }],
+            success,
+        }
+    }
+}
+
+/// Content item accepted in a dynamic-tool result.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CodexDynamicToolCallOutputContentItem {
+    /// Text returned to the worker's reasoning loop.
+    InputText {
+        /// Tool result text.
+        text: String,
+    },
+}
+
 /// App-server request that requires a client response.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodexServerRequest {
     id: CodexRequestId,
     method: String,
     params: Value,
+    dynamic_tool_call: Option<CodexDynamicToolCallParams>,
 }
 
 impl CodexServerRequest {
@@ -588,6 +733,12 @@ impl CodexServerRequest {
     #[must_use]
     pub const fn params(&self) -> &Value {
         &self.params
+    }
+
+    /// Typed dynamic-tool parameters when this is `item/tool/call`.
+    #[must_use]
+    pub const fn dynamic_tool_call(&self) -> Option<&CodexDynamicToolCallParams> {
+        self.dynamic_tool_call.as_ref()
     }
 }
 
@@ -666,7 +817,20 @@ pub(super) struct OutboundRpcError<'a> {
 pub(super) fn decode_event(message: InboundMessage) -> Result<CodexAppServerEvent, String> {
     match message {
         InboundMessage::Request { id, method, params } => {
-            Ok(CodexAppServerEvent::Request(CodexServerRequest { id, method, params }))
+            let dynamic_tool_call = if method == "item/tool/call" {
+                Some(
+                    serde_json::from_value(params.clone())
+                        .map_err(|error| format!("item/tool/call parameters: {error}"))?,
+                )
+            } else {
+                None
+            };
+            Ok(CodexAppServerEvent::Request(CodexServerRequest {
+                id,
+                method,
+                params,
+                dynamic_tool_call,
+            }))
         }
         InboundMessage::Notification { method, params } => {
             let notification = match method.as_str() {

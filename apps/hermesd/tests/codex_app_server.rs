@@ -2,11 +2,12 @@
 
 #![cfg(unix)]
 
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use hermesd::adapters::{
     CodexAppServer, CodexAppServerCommand, CodexAppServerError, CodexAppServerEvent,
-    CodexApprovalPolicy, CodexInitializeParams, CodexNotification, CodexSandboxMode,
+    CodexApprovalPolicy, CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec,
+    CodexDynamicToolSpec, CodexInitializeParams, CodexNotification, CodexSandboxMode,
     CodexThreadStartParams, CodexTurnInterruptParams, CodexTurnStartParams, CodexTurnStatus,
 };
 use serde_json::json;
@@ -42,6 +43,9 @@ require_text '"method":"thread/start"'
 require_text '"model":"gpt-5.6-luna"'
 require_text '"approvalPolicy":"never"'
 require_text '"sandbox":"read-only"'
+require_text '"config":{"features.shell_tool":false}'
+require_text '"dynamicTools":[{"type":"function","name":"hermes_read_file"'
+require_text '"inputSchema":{"additionalProperties":false,"properties":{"path":{"type":"string"}},"required":["path"],"type":"object"}'
 emit '{"method":"thread/started","params":{"thread":{"id":"thread-1"}}}'
 emit '{"id":2,"result":{"thread":{"id":"thread-1"},"model":"gpt-5.6-luna","modelProvider":"openai_http","cwd":"/tmp/fake-workspace","approvalPolicy":"never","sandbox":{"type":"readOnly"}}}'
 
@@ -54,6 +58,14 @@ emit '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"tur
 emit '{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}'
 emit '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"hello "}}'
 emit '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"world"}}'
+emit '{"id":"dynamic-1","method":"item/tool/call","params":{"threadId":"thread-1","turnId":"turn-1","callId":"worker-call-1","namespace":null,"tool":"hermes_read_file","arguments":{"path":"README.md"}}}'
+
+read_frame
+require_text '"id":"dynamic-1"'
+require_text '"contentItems":[{'
+require_text '"type":"inputText"'
+require_text '"text":"1|hello"'
+require_text '"success":true'
 emit '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[]}}}'
 
 read_frame
@@ -110,6 +122,19 @@ fi
                 .with_sandbox(CodexSandboxMode::ReadOnly)
                 .with_base_instructions("Stay within Hermes authority.")
                 .with_developer_instructions("Use only client-hosted capabilities.")
+                .with_config(BTreeMap::from([("features.shell_tool".into(), json!(false))]))
+                .with_dynamic_tools(vec![CodexDynamicToolSpec::Function(
+                    CodexDynamicToolFunctionSpec::new(
+                        "hermes_read_file",
+                        "Read one file through Hermes.",
+                        json!({
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                            "additionalProperties": false
+                        }),
+                    ),
+                )])
                 .with_ephemeral(false),
         )
         .await?;
@@ -158,6 +183,25 @@ fi
         text.push_str(delta.delta());
     }
     assert_eq!(text, "hello world");
+    let CodexAppServerEvent::Request(dynamic_request) = client.next_event().await? else {
+        return Err("expected dynamic tool request".into());
+    };
+    assert_eq!(dynamic_request.method(), "item/tool/call");
+    let Some(call) = dynamic_request.dynamic_tool_call() else {
+        return Err("dynamic tool request was not decoded into typed parameters".into());
+    };
+    assert_eq!(call.thread_id(), "thread-1");
+    assert_eq!(call.turn_id(), "turn-1");
+    assert_eq!(call.call_id(), "worker-call-1");
+    assert_eq!(call.namespace(), None);
+    assert_eq!(call.tool(), "hermes_read_file");
+    assert_eq!(call.arguments(), &json!({"path": "README.md"}));
+    client
+        .respond_dynamic_tool_call(
+            &dynamic_request,
+            &CodexDynamicToolCallResponse::text("1|hello", true),
+        )
+        .await?;
     let CodexAppServerEvent::Notification(CodexNotification::TurnCompleted(completed)) =
         client.next_event().await?
     else {
@@ -201,6 +245,29 @@ emit 'this is not json'
         Err(error) => error,
     };
     assert!(matches!(error, CodexAppServerError::MalformedFrame(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_dynamic_tool_request_fails_closed() -> Result<(), Box<dyn std::error::Error>> {
+    let (_fixture, executable) = fake_app_server(
+        r#"
+read_frame
+emit '{"id":"dynamic-bad","method":"item/tool/call","params":{"threadId":"thread-1","turnId":"turn-1","callId":"call-1","arguments":{}}}'
+"#,
+    )?;
+    let mut client = CodexAppServer::spawn(&CodexAppServerCommand::new(executable))?;
+    let error = match client
+        .initialize(&CodexInitializeParams::hermes("0.1.0").with_experimental_api(true))
+        .await
+    {
+        Ok(_) => return Err("malformed dynamic tool request unexpectedly initialized".into()),
+        Err(error) => error,
+    };
+    let CodexAppServerError::Protocol(message) = error else {
+        return Err(format!("expected protocol error, got {error}").into());
+    };
+    assert!(message.contains("item/tool/call parameters"));
     Ok(())
 }
 

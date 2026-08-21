@@ -12,11 +12,14 @@ use std::{
 };
 
 pub use protocol::{
-    CodexAgentMessageDelta, CodexAppServerEvent, CodexApprovalPolicy, CodexInitializeParams,
-    CodexInitializeResponse, CodexNotification, CodexRequestId, CodexSandboxMode,
-    CodexServerRequest, CodexThread, CodexThreadOpenResponse, CodexThreadResumeParams,
-    CodexThreadStartParams, CodexTurn, CodexTurnCompleted, CodexTurnInterruptParams,
-    CodexTurnStartParams, CodexTurnStartResponse, CodexTurnStarted, CodexTurnStatus,
+    CodexAgentMessageDelta, CodexAppServerEvent, CodexApprovalPolicy,
+    CodexDynamicToolCallOutputContentItem, CodexDynamicToolCallParams,
+    CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec, CodexDynamicToolSpec,
+    CodexInitializeParams, CodexInitializeResponse, CodexNotification, CodexRequestId,
+    CodexSandboxMode, CodexServerRequest, CodexThread, CodexThreadOpenResponse,
+    CodexThreadResumeParams, CodexThreadStartParams, CodexTurn, CodexTurnCompleted,
+    CodexTurnInterruptParams, CodexTurnStartParams, CodexTurnStartResponse, CodexTurnStarted,
+    CodexTurnStatus,
 };
 use protocol::{
     InboundMessage, OutboundErrorResponse, OutboundNotification, OutboundRequest, OutboundResponse,
@@ -244,6 +247,22 @@ impl CodexAppServer {
         result: &Value,
     ) -> Result<(), CodexAppServerError> {
         self.write_frame(&OutboundResponse { id, result }).await
+    }
+
+    /// Return a typed result for one `item/tool/call` request.
+    pub async fn respond_dynamic_tool_call(
+        &mut self,
+        request: &CodexServerRequest,
+        response: &CodexDynamicToolCallResponse,
+    ) -> Result<(), CodexAppServerError> {
+        if request.dynamic_tool_call().is_none() {
+            return Err(CodexAppServerError::Protocol(format!(
+                "cannot send a dynamic-tool response for request {}",
+                request.method()
+            )));
+        }
+        let result = serde_json::to_value(response).map_err(CodexAppServerError::Encode)?;
+        self.respond(request.id(), &result).await
     }
 
     /// Answer one server-owned request with a JSON-RPC error.
