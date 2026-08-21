@@ -922,7 +922,6 @@ fn validate_config(config: &SessionConfig) -> Result<(), SessionStoreError> {
     }
     for (name, value) in [
         ("provider adapter", config.provider_adapter.as_str()),
-        ("base URL", config.base_url.as_str()),
         ("model", config.model.as_str()),
         ("tool root", config.tool_root.as_str()),
     ] {
@@ -930,6 +929,27 @@ fn validate_config(config: &SessionConfig) -> Result<(), SessionStoreError> {
             return Err(SessionStoreError::Invalid(format!(
                 "{name} must be non-empty and have no surrounding whitespace"
             )));
+        }
+    }
+    match config.transport {
+        TransportKind::CodexAppServer => {
+            if config.provider_adapter != "codex-app-server" {
+                return Err(SessionStoreError::Invalid(
+                    "Codex app-server transport requires the codex-app-server adapter".into(),
+                ));
+            }
+            if !config.base_url.is_empty() || config.api_key_env.is_some() {
+                return Err(SessionStoreError::Invalid(
+                    "Codex app-server sessions cannot persist an API endpoint or credential".into(),
+                ));
+            }
+        }
+        _ => {
+            if config.base_url.is_empty() || config.base_url.trim() != config.base_url {
+                return Err(SessionStoreError::Invalid(
+                    "base URL must be non-empty and have no surrounding whitespace".into(),
+                ));
+            }
         }
     }
     if !Path::new(&config.tool_root).is_absolute() {

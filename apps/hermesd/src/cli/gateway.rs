@@ -32,8 +32,8 @@ use super::{
     state::state_path,
 };
 use crate::adapters::{
-    ApprovalControl, ApprovalControlError, SqliteDelegationStore, SqliteForegroundTurnStore,
-    SqliteSessionStore,
+    AgentTools, ApprovalControl, ApprovalControlError, SqliteDelegationStore,
+    SqliteForegroundTurnStore, SqliteSessionStore,
 };
 
 const RESTART_RECONCILIATION_REASON: &str =
@@ -290,6 +290,8 @@ impl GatewayHost {
             SessionStoreError::NotFound(_) => RpcError::new(4040, error.to_string()),
             other => internal_error(other),
         })?;
+        let session_settings = LiveSettings::from_snapshot_for_host(&snapshot, &self.settings)
+            .map_err(|error| RpcError::new(4094, error.to_string()))?;
         let latest = SqliteForegroundTurnStore::open(&self.state)
             .map_err(internal_error)?
             .latest(&session_id)
@@ -307,7 +309,7 @@ impl GatewayHost {
             "running": busy,
             "status": if busy { "working" } else { "idle" },
             "started_at": 0,
-            "info": self.session_info(),
+            "info": session_info(&session_settings),
         }))
     }
 
@@ -561,6 +563,10 @@ impl GatewayHost {
                 return self.writer.send(&GatewayFailure::new(id, 4040, error.to_string()));
             }
         };
+        if let Err(error) = LiveSettings::from_snapshot_for_host(&snapshot, &self.settings) {
+            self.clear_busy(sid.as_str());
+            return self.writer.send(&GatewayFailure::new(id, 4094, error.to_string()));
+        }
         let generation = snapshot.owner_generation;
         let deliveries = match claim_parent_completions(&self.state, &sid, started_at_ms) {
             Ok(deliveries) => deliveries,
@@ -648,7 +654,13 @@ impl GatewayHost {
             let result = tokio::select! {
                 biased;
                 _ = cancel_receiver => None,
-                result = run_session_turn(&state, &writer, &claim, &approval_control) => Some(result),
+                result = run_session_turn(
+                    &state,
+                    &writer,
+                    &claim,
+                    &approval_control,
+                    &settings,
+                ) => Some(result),
             };
             let result = match result {
                 Some(Ok(final_response)) => Ok(TurnExit::Completed(final_response)),
@@ -812,6 +824,7 @@ async fn run_session_turn(
     writer: &FrameWriter,
     claim: &ForegroundTurnSnapshot,
     approval_control: &ApprovalControl,
+    host_settings: &LiveSettings,
 ) -> anyhow::Result<String> {
     let session_id = &claim.spec.session_id;
     let expected_generation = claim.owner_generation;
@@ -824,7 +837,7 @@ async fn run_session_turn(
             snapshot.owner_generation.get()
         );
     }
-    let settings = LiveSettings::from_snapshot(&snapshot)?;
+    let settings = LiveSettings::from_snapshot_for_host(&snapshot, host_settings)?;
     let previous_len = snapshot.conversation.len();
     let scope = format!(
         "session:{}:generation:{}",
@@ -884,14 +897,26 @@ fn terminate_turn(
 }
 
 fn session_info(settings: &LiveSettings) -> Value {
+    let workspace = ["read_file", "search_files"];
+    let delegation = if AgentTools::catalog_enables_delegation(settings.tools()) {
+        vec!["delegate_task"]
+    } else {
+        Vec::new()
+    };
+    let terminal = if AgentTools::catalog_enables_terminal(settings.tools()) {
+        vec!["terminal"]
+    } else {
+        Vec::new()
+    };
     json!({
         "cwd": settings.root(),
+        "engine": settings.engine_name(),
         "model": settings.model(),
         "skills": {},
         "tools": {
-            "workspace": ["read_file", "search_files"],
-            "delegation": ["delegate_task"],
-            "terminal": ["terminal"],
+            "workspace": workspace,
+            "delegation": delegation,
+            "terminal": terminal,
         },
         "usage": zero_usage(settings.model()),
         "version": env!("CARGO_PKG_VERSION"),

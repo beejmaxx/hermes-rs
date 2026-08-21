@@ -116,6 +116,25 @@ cargo run -p hermesd -- gateway \
   --root .
 ```
 
+It can instead supervise the locally authenticated Codex runtime without an
+API key:
+
+```bash
+cargo run -p hermesd -- gateway \
+  --engine codex \
+  --codex-command /absolute/path/to/codex \
+  --model gpt-5.6-sol \
+  --root .
+```
+
+Codex receives the frozen `read_file`, `search_files`, and approved `terminal`
+schemas. Hermes explicitly disables Codex environments, shell, web search,
+plugins, hooks, apps, multi-agent features, and effective user MCP servers for
+the worker. The Codex model may request a dynamic tool, but Rust issues the
+invocation identity and owns approval, execution, journaling, and the semantic
+transcript. Background delegation remains disabled for this engine until child
+turns can inherit the selected cognitive engine safely.
+
 It writes protocol frames—not a human interface—to stdout and reserves stderr
 for diagnostics. A normal user should launch it through a compatible client.
 
@@ -138,6 +157,17 @@ npm start --workspace ui-tui -- \
   gateway \
   --provider openrouter \
   --model your-model-id \
+  --root /absolute/path/to/your/workspace
+```
+
+For the authenticated Codex engine, replace the gateway arguments after
+`hermesd` with:
+
+```bash
+gateway \
+  --engine codex \
+  --codex-command /absolute/path/to/codex \
+  --model gpt-5.6-sol \
   --root /absolute/path/to/your/workspace
 ```
 
@@ -165,6 +195,9 @@ This is a usable vertical slice, not a claim of full gateway parity:
   per-call terminal `once`/`deny`, not session or permanent policies.
 - Background-child steering, nested delegation, and replay of an ambiguous
   child outcome are not implemented.
+- Codex-backed turns currently use a fresh ephemeral app-server thread and a
+  bounded semantic-history projection. Persistent Codex thread binding/resume
+  and graceful app-server interruption are not implemented yet.
 
 Unsupported methods return JSON-RPC `-32601`; the gateway does not silently
 pretend that a capability exists. These gaps define follow-up behavior slices

@@ -76,6 +76,10 @@ require_text '"id":4'
 require_text '"method":"turn/start"'
 require_text '"threadId":"thread-authority"'
 require_text '"text":"Read README.md and report its contents."'
+require_text '"environments":[]'
+require_text '"approvalPolicy":"never"'
+require_text '"sandboxPolicy":{"type":"readOnly","networkAccess":false}'
+require_text '"model":"gpt-5.6-luna"'
 emit '{"method":"turn/started","params":{"threadId":"thread-authority","turn":{"id":"turn-authority","status":"inProgress","items":[]}}}'
 emit '{"id":4,"result":{"turn":{"id":"turn-authority","status":"inProgress","items":[]}}}'
 emit '{"id":"dynamic-read","method":"item/tool/call","params":{"threadId":"thread-authority","turnId":"turn-authority","callId":"worker-call-read","namespace":null,"tool":"read_file","arguments":{"path":"README.md"}}}'
@@ -99,7 +103,6 @@ fi
         CodexAppServerCommand::new(executable),
         "gpt-5.6-luna",
         &canonical_workspace,
-        "Hermes owns durable state and tool authority.",
         "Use only the dynamic tools supplied by Hermes.",
     )?
     .with_effort("low");

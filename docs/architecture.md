@@ -109,10 +109,13 @@ identity, journal and execute it, and return the terminal evidence. Hermes
 retains the canonical semantic transcript. The Codex thread identity and
 capability manifest are opaque binding evidence, not conversation authority.
 
-The current proof intentionally opens one ephemeral worker thread for one
-turn. Durable worker bindings, thread resume, interrupt propagation, and
-gateway engine selection remain host-integration work; the adapter does not
-pretend those lifecycle semantics are complete.
+The CLI and stdio gateway can select this engine explicitly. The current host
+still opens one ephemeral worker thread per turn; for later turns it projects
+the canonical Hermes transcript into a fresh worker input while stripping
+provider replay, execution identities, and hidden reasoning. Durable worker
+bindings, native Codex thread resume, and graceful interrupt propagation remain
+host-integration work; the adapter does not pretend those lifecycle semantics
+are complete.
 
 The durable proof currently covers:
 

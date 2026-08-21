@@ -91,6 +91,28 @@ impl AgentToolsConfig {
         })
     }
 
+    /// Configure only workspace and approved-terminal tools for an external cognitive engine.
+    pub fn without_delegation(
+        root: impl Into<PathBuf>,
+        state: impl Into<PathBuf>,
+        model: impl Into<String>,
+    ) -> Result<Self, AgentToolsConfigError> {
+        let model = model.into();
+        if model.is_empty() || model.trim() != model {
+            return Err(AgentToolsConfigError::InvalidModel);
+        }
+        Ok(Self {
+            base_url: String::new(),
+            api_key: None,
+            model,
+            root: root.into(),
+            state: state.into(),
+            delegation_enabled: false,
+            background_parent: None,
+            terminal_approval: None,
+        })
+    }
+
     /// Route delegation calls into durable background work for this parent.
     #[must_use]
     pub fn with_background_parent(mut self, parent_session_id: SessionId) -> Self {
@@ -180,6 +202,14 @@ impl AgentTools {
                 Value::String(BACKGROUND_DELEGATE_DESCRIPTION.into()),
             );
         }
+        tools.push(TerminalTool::schema());
+        tools
+    }
+
+    /// Ordered schemas for a supervised external engine with approved local terminal access.
+    #[must_use]
+    pub fn operator_catalog() -> Vec<Value> {
+        let mut tools = ReadOnlyLocalTools::catalog();
         tools.push(TerminalTool::schema());
         tools
     }

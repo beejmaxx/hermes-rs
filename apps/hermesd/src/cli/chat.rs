@@ -18,14 +18,18 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::adapters::{
-    AgentTools, AgentToolsConfig, ApprovalControl, OpenAiCompatibleProvider, ReadOnlyLocalTools,
-    SqliteEffectLedger, SqliteSessionStore,
+    AgentTools, AgentToolsConfig, ApprovalControl, CodexAppServerCommand, CodexEngineTurnRequest,
+    CodexTurnEngine, OpenAiCompatibleProvider, ReadOnlyLocalTools, SqliteEffectLedger,
+    SqliteSessionStore,
 };
 use crate::cli::state::state_path;
 
 /// Provider and immutable runtime settings shared by live hosts.
 #[derive(Clone, Debug, clap::Args)]
 pub(super) struct RuntimeArgs {
+    /// Cognitive engine. Defaults to direct for a new or ephemeral session.
+    #[arg(long, value_enum)]
+    engine: Option<EnginePreset>,
     /// Provider preset. Defaults to openai for a new or ephemeral session.
     #[arg(long, value_enum)]
     provider: Option<ProviderPreset>,
@@ -44,6 +48,9 @@ pub(super) struct RuntimeArgs {
     /// Override the frozen system prompt for a new session.
     #[arg(long)]
     system: Option<String>,
+    /// Authenticated Codex executable used when --engine codex is selected.
+    #[arg(long, value_name = "PATH")]
+    codex_command: Option<PathBuf>,
 }
 
 /// Arguments for one live chat turn.
@@ -72,15 +79,25 @@ enum ProviderPreset {
     Custom,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum EnginePreset {
+    /// Hermes owns the agent loop and calls a model provider directly.
+    Direct,
+    /// Hermes supervises an authenticated Codex app-server cognitive loop.
+    Codex,
+}
+
 #[derive(Clone)]
 pub(super) struct LiveSettings {
-    provider: ProviderPreset,
+    engine: EnginePreset,
+    provider: Option<ProviderPreset>,
     base_url: String,
     api_key_env: Option<String>,
     model: String,
     root: PathBuf,
     system_prompt: String,
     tools: Vec<Value>,
+    codex_command: Option<CodexAppServerCommand>,
 }
 
 /// Execute one ephemeral or durable live agent turn.
@@ -243,16 +260,26 @@ async fn execute_turn_inner(
     session_id: Option<&SessionId>,
     hooks: TurnHooks<'_>,
 ) -> anyhow::Result<ContractOutcome> {
-    let api_key = read_api_key(settings.api_key_env.as_deref())?;
-    let mut provider = OpenAiCompatibleProvider::new(&settings.base_url, api_key.clone())?;
-    let mut tools_config = AgentToolsConfig::new(
-        settings.root.clone(),
-        state.to_path_buf(),
-        settings.base_url.clone(),
-        api_key,
-        settings.model.clone(),
-        AgentTools::catalog_enables_delegation(&settings.tools),
-    )?;
+    let TurnHooks { observer, approval_control } = hooks;
+    let api_key = match settings.engine {
+        EnginePreset::Direct => read_api_key(settings.api_key_env.as_deref())?,
+        EnginePreset::Codex => None,
+    };
+    let mut tools_config = match settings.engine {
+        EnginePreset::Direct => AgentToolsConfig::new(
+            settings.root.clone(),
+            state.to_path_buf(),
+            settings.base_url.clone(),
+            api_key.clone(),
+            settings.model.clone(),
+            AgentTools::catalog_enables_delegation(&settings.tools),
+        )?,
+        EnginePreset::Codex => AgentToolsConfig::without_delegation(
+            settings.root.clone(),
+            state.to_path_buf(),
+            settings.model.clone(),
+        )?,
+    };
     if AgentTools::catalog_uses_background_delivery(&settings.tools) {
         let parent = session_id
             .context("durable background delegation requires an owning parent session")?;
@@ -260,9 +287,8 @@ async fn execute_turn_inner(
     }
     if AgentTools::catalog_enables_terminal(&settings.tools) {
         let session_id = session_id.context("terminal tool requires an owning session")?;
-        let approval_control = hooks
-            .approval_control
-            .context("terminal tool requires a live session approval channel")?;
+        let approval_control =
+            approval_control.context("terminal tool requires a live session approval channel")?;
         tools_config =
             tools_config.with_terminal_approval(session_id.clone(), approval_control.clone());
     }
@@ -270,21 +296,63 @@ async fn execute_turn_inner(
     let ledger = SqliteEffectLedger::open(state)
         .with_context(|| format!("could not open effect ledger {}", state.display()))?;
     let mut tools = JournaledToolBroker::new(tools, ledger, scope)?;
-    let mut conversation = runtime::project_conversation(&semantic_history)?;
-    conversation.push(ProviderMessage::User { content: prompt.into() });
-    let request = AgentTurnRequest {
-        execution_scope: scope.into(),
-        transport: TransportKind::ChatCompletions,
-        model: settings.model.clone(),
-        system_prompt: Some(settings.system_prompt.clone()),
-        conversation,
-        tools: settings.tools.clone(),
-    };
-    match hooks.observer {
-        Some(observer) => runtime::run_turn_observed(request, &mut provider, &mut tools, observer)
-            .await
-            .map_err(Into::into),
-        None => runtime::run_turn(request, &mut provider, &mut tools).await.map_err(Into::into),
+    match settings.engine {
+        EnginePreset::Direct => {
+            let mut provider = OpenAiCompatibleProvider::new(&settings.base_url, api_key)?;
+            let mut conversation = runtime::project_conversation(&semantic_history)?;
+            conversation.push(ProviderMessage::User { content: prompt.into() });
+            let request = AgentTurnRequest {
+                execution_scope: scope.into(),
+                transport: TransportKind::ChatCompletions,
+                model: settings.model.clone(),
+                system_prompt: Some(settings.system_prompt.clone()),
+                conversation,
+                tools: settings.tools.clone(),
+            };
+            match observer {
+                Some(observer) => {
+                    runtime::run_turn_observed(request, &mut provider, &mut tools, observer)
+                        .await
+                        .map_err(Into::into)
+                }
+                None => {
+                    runtime::run_turn(request, &mut provider, &mut tools).await.map_err(Into::into)
+                }
+            }
+        }
+        EnginePreset::Codex => {
+            let command = settings
+                .codex_command
+                .clone()
+                .context("Codex engine has no configured app-server command")?;
+            let engine = CodexTurnEngine::new(
+                command,
+                &settings.model,
+                &settings.root,
+                &settings.system_prompt,
+            )?;
+            let request = CodexEngineTurnRequest {
+                execution_scope: scope.into(),
+                semantic_history,
+                prompt: prompt.into(),
+                client_user_message_id: Some(scope.into()),
+            };
+            match observer {
+                Some(observer) => engine
+                    .run_new(request, &settings.tools, &mut tools, observer)
+                    .await
+                    .map(|outcome| outcome.contract)
+                    .map_err(Into::into),
+                None => {
+                    let mut observer = runtime::NoopEventObserver;
+                    engine
+                        .run_new(request, &settings.tools, &mut tools, &mut observer)
+                        .await
+                        .map(|outcome| outcome.contract)
+                        .map_err(Into::into)
+                }
+            }
+        }
     }
 }
 
@@ -310,14 +378,23 @@ pub(super) fn completed_response(outcome: &ContractOutcome) -> anyhow::Result<&s
 
 impl LiveSettings {
     pub(super) fn for_new(arguments: &RuntimeArgs) -> anyhow::Result<Self> {
-        Self::for_new_with_tools(arguments, AgentTools::catalog())
+        let tools = match arguments.engine.unwrap_or(EnginePreset::Direct) {
+            EnginePreset::Direct => AgentTools::catalog(),
+            EnginePreset::Codex => ReadOnlyLocalTools::catalog(),
+        };
+        Self::for_new_with_tools(arguments, tools)
     }
 
     pub(super) fn for_gateway(arguments: &RuntimeArgs) -> anyhow::Result<Self> {
-        Self::for_new_with_tools(arguments, AgentTools::background_catalog())
+        let tools = match arguments.engine.unwrap_or(EnginePreset::Direct) {
+            EnginePreset::Direct => AgentTools::background_catalog(),
+            EnginePreset::Codex => AgentTools::operator_catalog(),
+        };
+        Self::for_new_with_tools(arguments, tools)
     }
 
     fn for_new_with_tools(arguments: &RuntimeArgs, tools: Vec<Value>) -> anyhow::Result<Self> {
+        let engine = arguments.engine.unwrap_or(EnginePreset::Direct);
         let provider = arguments.provider.unwrap_or(ProviderPreset::OpenAi);
         let model = arguments
             .model
@@ -329,50 +406,77 @@ impl LiveSettings {
         let root_input = arguments.root.as_deref().unwrap_or_else(|| Path::new("."));
         let root = std::fs::canonicalize(root_input)
             .with_context(|| format!("could not resolve tool root {}", root_input.display()))?;
-        let (default_base_url, default_api_key_env) = provider.defaults();
-        let base_url = arguments.base_url.as_deref().unwrap_or(default_base_url);
-        if base_url.is_empty() {
-            anyhow::bail!("--base-url is required with --provider custom");
-        }
-        OpenAiCompatibleProvider::validate_base_url(base_url)?;
+        let (base_url, api_key_env, codex_command) = match engine {
+            EnginePreset::Direct => {
+                if arguments.codex_command.is_some() {
+                    anyhow::bail!("--codex-command requires --engine codex");
+                }
+                let (default_base_url, default_api_key_env) = provider.defaults();
+                let base_url = arguments.base_url.as_deref().unwrap_or(default_base_url);
+                if base_url.is_empty() {
+                    anyhow::bail!("--base-url is required with --provider custom");
+                }
+                OpenAiCompatibleProvider::validate_base_url(base_url)?;
+                (
+                    base_url.to_owned(),
+                    arguments
+                        .api_key_env
+                        .clone()
+                        .or_else(|| default_api_key_env.map(str::to_owned)),
+                    None,
+                )
+            }
+            EnginePreset::Codex => {
+                if arguments.provider.is_some()
+                    || arguments.base_url.is_some()
+                    || arguments.api_key_env.is_some()
+                {
+                    anyhow::bail!(
+                        "--provider, --base-url, and --api-key-env apply only to --engine direct"
+                    );
+                }
+                let executable =
+                    arguments.codex_command.clone().unwrap_or_else(|| PathBuf::from("codex"));
+                (String::new(), None, Some(CodexAppServerCommand::new(executable)))
+            }
+        };
         let _validated_tools = ReadOnlyLocalTools::new(&root, "session-config-validation")?;
-        let api_key_env =
-            arguments.api_key_env.clone().or_else(|| default_api_key_env.map(str::to_owned));
         let system_prompt = arguments.system.clone().unwrap_or_else(|| {
             let terminal = if AgentTools::catalog_enables_terminal(&tools) {
                 " You may propose one terminal command at a time; it runs only after the user explicitly approves it."
             } else {
                 " Never claim to have modified files or run commands."
             };
+            let delegation = if AgentTools::catalog_enables_delegation(&tools) {
+                " You may delegate focused independent subtasks to isolated leaf agents."
+            } else {
+                ""
+            };
             format!(
-                "You are Hermes RS, a precise and helpful agent. You may inspect the workspace at {} using read_file and search_files. These tools are read-only. You may delegate focused independent subtasks to isolated leaf agents.{terminal}",
+                "You are Hermes RS, a precise and helpful agent. You may inspect the workspace at {} using read_file and search_files. These tools are read-only.{delegation}{terminal}",
                 root.display()
             )
         });
         Ok(Self {
-            provider,
-            base_url: base_url.into(),
+            engine,
+            provider: (engine == EnginePreset::Direct).then_some(provider),
+            base_url,
             api_key_env,
             model: model.into(),
             root,
             system_prompt,
             tools,
+            codex_command,
         })
     }
 
     fn for_resume(arguments: &RuntimeArgs, snapshot: &SessionSnapshot) -> anyhow::Result<Self> {
         let config = &snapshot.config;
-        let provider = ProviderPreset::from_adapter(&config.provider_adapter)?;
-        if arguments.provider.is_some_and(|value| value != provider) {
-            anyhow::bail!("--provider cannot change for an existing session");
+        let engine = EnginePreset::from_config(config)?;
+        if arguments.engine.is_some_and(|value| value != engine) {
+            anyhow::bail!("--engine cannot change for an existing session");
         }
         reject_changed("--model", arguments.model.as_deref(), Some(&config.model))?;
-        reject_changed("--base-url", arguments.base_url.as_deref(), Some(&config.base_url))?;
-        reject_changed(
-            "--api-key-env",
-            arguments.api_key_env.as_deref(),
-            config.api_key_env.as_deref(),
-        )?;
         reject_changed("--system", arguments.system.as_deref(), Some(&config.system_prompt))?;
         let root = PathBuf::from(&config.tool_root);
         if let Some(supplied) = &arguments.root {
@@ -382,37 +486,123 @@ impl LiveSettings {
                 anyhow::bail!("--root cannot change for an existing session");
             }
         }
-        Ok(Self {
-            provider,
-            base_url: config.base_url.clone(),
-            api_key_env: config.api_key_env.clone(),
-            model: config.model.clone(),
-            root,
-            system_prompt: config.system_prompt.clone(),
-            tools: config.tools.clone(),
-        })
+        match engine {
+            EnginePreset::Direct => {
+                if arguments.codex_command.is_some() {
+                    anyhow::bail!("--codex-command requires a Codex session");
+                }
+                let provider = ProviderPreset::from_adapter(&config.provider_adapter)?;
+                if arguments.provider.is_some_and(|value| value != provider) {
+                    anyhow::bail!("--provider cannot change for an existing session");
+                }
+                reject_changed(
+                    "--base-url",
+                    arguments.base_url.as_deref(),
+                    Some(&config.base_url),
+                )?;
+                reject_changed(
+                    "--api-key-env",
+                    arguments.api_key_env.as_deref(),
+                    config.api_key_env.as_deref(),
+                )?;
+                Ok(Self {
+                    engine,
+                    provider: Some(provider),
+                    base_url: config.base_url.clone(),
+                    api_key_env: config.api_key_env.clone(),
+                    model: config.model.clone(),
+                    root,
+                    system_prompt: config.system_prompt.clone(),
+                    tools: config.tools.clone(),
+                    codex_command: None,
+                })
+            }
+            EnginePreset::Codex => {
+                if arguments.provider.is_some()
+                    || arguments.base_url.is_some()
+                    || arguments.api_key_env.is_some()
+                {
+                    anyhow::bail!(
+                        "--provider, --base-url, and --api-key-env do not apply to a Codex session"
+                    );
+                }
+                Ok(Self::codex_from_snapshot(snapshot, arguments.codex_command.clone()))
+            }
+        }
     }
 
     pub(super) fn from_snapshot(snapshot: &SessionSnapshot) -> anyhow::Result<Self> {
         let config = &snapshot.config;
-        Ok(Self {
-            provider: ProviderPreset::from_adapter(&config.provider_adapter)?,
+        match EnginePreset::from_config(config)? {
+            EnginePreset::Direct => Ok(Self {
+                engine: EnginePreset::Direct,
+                provider: Some(ProviderPreset::from_adapter(&config.provider_adapter)?),
+                base_url: config.base_url.clone(),
+                api_key_env: config.api_key_env.clone(),
+                model: config.model.clone(),
+                root: PathBuf::from(&config.tool_root),
+                system_prompt: config.system_prompt.clone(),
+                tools: config.tools.clone(),
+                codex_command: None,
+            }),
+            EnginePreset::Codex => Ok(Self::codex_from_snapshot(snapshot, None)),
+        }
+    }
+
+    pub(super) fn from_snapshot_for_host(
+        snapshot: &SessionSnapshot,
+        host: &Self,
+    ) -> anyhow::Result<Self> {
+        let mut settings = Self::from_snapshot(snapshot)?;
+        if settings.engine != host.engine {
+            anyhow::bail!(
+                "session engine {} does not match gateway engine {}",
+                settings.engine.as_str(),
+                host.engine.as_str()
+            );
+        }
+        if settings.engine == EnginePreset::Codex {
+            settings.codex_command = host.codex_command.clone();
+        }
+        Ok(settings)
+    }
+
+    fn codex_from_snapshot(snapshot: &SessionSnapshot, command: Option<PathBuf>) -> Self {
+        let config = &snapshot.config;
+        Self {
+            engine: EnginePreset::Codex,
+            provider: None,
             base_url: config.base_url.clone(),
-            api_key_env: config.api_key_env.clone(),
+            api_key_env: None,
             model: config.model.clone(),
             root: PathBuf::from(&config.tool_root),
             system_prompt: config.system_prompt.clone(),
             tools: config.tools.clone(),
-        })
+            codex_command: Some(CodexAppServerCommand::new(
+                command.unwrap_or_else(|| PathBuf::from("codex")),
+            )),
+        }
     }
 
     pub(super) fn session_config(&self, session_id: SessionId) -> anyhow::Result<SessionConfig> {
         let tools_bytes = serde_json::to_vec(&self.tools)?;
-        let engine = EngineId::new(format!(
-            "rust-v1:chat-completions:{}:{}",
-            self.provider.as_str(),
-            self.model
-        ))?;
+        let (engine_id, transport, provider_adapter) = match self.engine {
+            EnginePreset::Direct => {
+                let provider =
+                    self.provider.context("direct engine has no configured provider adapter")?;
+                (
+                    format!("rust-v1:chat-completions:{}:{}", provider.as_str(), self.model),
+                    TransportKind::ChatCompletions,
+                    provider.as_str(),
+                )
+            }
+            EnginePreset::Codex => (
+                format!("rust-v1:codex-app-server:{}", self.model),
+                TransportKind::CodexAppServer,
+                "codex-app-server",
+            ),
+        };
+        let engine = EngineId::new(engine_id)?;
         let root = self.root.to_str().context("tool root is not valid UTF-8")?.to_owned();
         Ok(SessionConfig {
             lineage_id: LineageId::new(session_id.as_str())?,
@@ -423,8 +613,8 @@ impl LiveSettings {
                 ManifestDigest::new(digest(self.system_prompt.as_bytes()))?,
                 ManifestDigest::new(digest(&tools_bytes))?,
             )?,
-            transport: TransportKind::ChatCompletions,
-            provider_adapter: self.provider.as_str().into(),
+            transport,
+            provider_adapter: provider_adapter.into(),
             base_url: self.base_url.clone(),
             api_key_env: self.api_key_env.clone(),
             model: self.model.clone(),
@@ -444,6 +634,35 @@ impl LiveSettings {
 
     pub(super) fn api_key_env(&self) -> Option<&str> {
         self.api_key_env.as_deref()
+    }
+
+    pub(super) fn tools(&self) -> &[Value] {
+        &self.tools
+    }
+
+    pub(super) const fn engine_name(&self) -> &'static str {
+        self.engine.as_str()
+    }
+}
+
+impl EnginePreset {
+    fn from_config(config: &SessionConfig) -> anyhow::Result<Self> {
+        match (config.transport, config.provider_adapter.as_str()) {
+            (TransportKind::ChatCompletions, "openai" | "openrouter" | "custom") => {
+                Ok(Self::Direct)
+            }
+            (TransportKind::CodexAppServer, "codex-app-server") => Ok(Self::Codex),
+            (transport, adapter) => anyhow::bail!(
+                "session engine is unsupported: transport {transport:?}, adapter {adapter:?}"
+            ),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Codex => "codex",
+        }
     }
 }
 

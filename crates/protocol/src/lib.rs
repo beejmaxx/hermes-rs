@@ -173,7 +173,7 @@ pub struct SessionConfig {
     pub transport: TransportKind,
     /// Stable provider-adapter name such as `openai` or `openrouter`.
     pub provider_adapter: String,
-    /// Non-secret OpenAI-compatible API base URL.
+    /// Non-secret provider endpoint; empty for a local-process cognitive engine.
     pub base_url: String,
     /// Name of the environment variable containing the credential, when required.
     pub api_key_env: Option<String>,

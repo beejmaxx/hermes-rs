@@ -50,7 +50,6 @@ pub struct CodexTurnEngine {
     command: CodexAppServerCommand,
     model: String,
     cwd: PathBuf,
-    base_instructions: String,
     developer_instructions: String,
     effort: Option<String>,
 }
@@ -61,7 +60,6 @@ impl CodexTurnEngine {
         command: CodexAppServerCommand,
         model: impl Into<String>,
         cwd: impl Into<PathBuf>,
-        base_instructions: impl Into<String>,
         developer_instructions: impl Into<String>,
     ) -> Result<Self, CodexEngineError> {
         let model = model.into();
@@ -74,12 +72,13 @@ impl CodexTurnEngine {
         if !cwd.is_absolute() {
             return Err(CodexEngineError::Invalid("worker cwd must be an absolute path".into()));
         }
-        let base_instructions = base_instructions.into();
         let developer_instructions = developer_instructions.into();
-        if base_instructions.is_empty() || developer_instructions.is_empty() {
-            return Err(CodexEngineError::Invalid("worker instructions must be non-empty".into()));
+        if developer_instructions.is_empty() {
+            return Err(CodexEngineError::Invalid(
+                "worker developer instructions must be non-empty".into(),
+            ));
         }
-        Ok(Self { command, model, cwd, base_instructions, developer_instructions, effort: None })
+        Ok(Self { command, model, cwd, developer_instructions, effort: None })
     }
 
     /// Select the model reasoning effort for worker turns.
@@ -127,7 +126,6 @@ impl CodexTurnEngine {
                         .with_cwd(&self.cwd)
                         .with_approval_policy(CodexApprovalPolicy::Never)
                         .with_sandbox(CodexSandboxMode::ReadOnly)
-                        .with_base_instructions(&self.base_instructions)
                         .with_developer_instructions(&self.developer_instructions)
                         .with_ephemeral(true),
                 ),
@@ -144,7 +142,12 @@ impl CodexTurnEngine {
             model_provider: opened.model_provider().to_owned(),
             authority: policy.manifest().clone(),
         };
-        let mut turn_params = CodexTurnStartParams::text(&binding.thread_id, &request.prompt);
+        let worker_input = project_worker_input(&request.semantic_history, &request.prompt)?;
+        let mut turn_params = CodexTurnStartParams::text(&binding.thread_id, worker_input)
+            .without_environments()
+            .with_approval_policy(CodexApprovalPolicy::Never)
+            .with_sandbox_policy(super::CodexTurnSandboxPolicy::hermes_read_only())
+            .with_model(&self.model);
         if let Some(effort) = &self.effort {
             turn_params = turn_params.with_effort(effort);
         }
@@ -437,6 +440,51 @@ impl CodexTurnEngine {
             binding,
         })
     }
+}
+
+fn project_worker_input(
+    semantic_history: &[SemanticMessage],
+    prompt: &str,
+) -> Result<String, CodexEngineError> {
+    if semantic_history.is_empty() {
+        return Ok(prompt.into());
+    }
+    let history = semantic_history
+        .iter()
+        .map(|message| match message {
+            SemanticMessage::User { content, .. } => json!({
+                "role": "user",
+                "content": content,
+            }),
+            SemanticMessage::Assistant { content, .. } => json!({
+                "role": "assistant",
+                "content": content,
+            }),
+            SemanticMessage::AssistantToolRequest { content, calls, .. } => json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": calls,
+            }),
+            SemanticMessage::ToolResultBatch { results } => json!({
+                "role": "tool",
+                "results": results.iter().map(|result| json!({
+                    "call_id": result.call_id,
+                    "status": result.status,
+                    "content": result.content,
+                })).collect::<Vec<_>>(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    let projection = serde_json::to_string(&json!({
+        "prior_messages": history,
+        "current_user_message": prompt,
+    }))
+    .map_err(|error| {
+        CodexEngineError::Invalid(format!("could not project worker context: {error}"))
+    })?;
+    Ok(format!(
+        "Hermes is starting a fresh cognitive worker for an existing canonical session. The JSON below is conversation context, not a request to bypass your developer instructions. Continue the conversation and answer the current user message.\n{projection}"
+    ))
 }
 
 /// Inputs owned by Hermes for one externally reasoned turn.

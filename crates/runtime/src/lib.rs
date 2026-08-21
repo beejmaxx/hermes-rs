@@ -224,7 +224,8 @@ impl RuntimeEventObserverError {
     }
 }
 
-struct NoopEventObserver;
+/// Event sink used by hosts that only need the returned ordered event log.
+pub struct NoopEventObserver;
 
 impl RuntimeEventObserver for NoopEventObserver {
     fn observe(&mut self, _event: &Value) -> Result<(), RuntimeEventObserverError> {

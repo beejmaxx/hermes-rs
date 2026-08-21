@@ -457,6 +457,12 @@ pub struct CodexTurnStartParams {
     thread_id: String,
     input: Vec<CodexUserInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    environments: Option<Vec<Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_policy: Option<CodexApprovalPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_policy: Option<CodexTurnSandboxPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<String>,
@@ -471,10 +477,34 @@ impl CodexTurnStartParams {
         Self {
             thread_id: thread_id.into(),
             input: vec![CodexUserInput::Text { text: text.into() }],
+            environments: None,
+            approval_policy: None,
+            sandbox_policy: None,
             model: None,
             effort: None,
             client_user_message_id: None,
         }
+    }
+
+    /// Disable every Codex-owned execution environment for this turn and subsequent turns.
+    #[must_use]
+    pub fn without_environments(mut self) -> Self {
+        self.environments = Some(Vec::new());
+        self
+    }
+
+    /// Freeze Codex's own approval behavior for this and subsequent turns.
+    #[must_use]
+    pub const fn with_approval_policy(mut self, policy: CodexApprovalPolicy) -> Self {
+        self.approval_policy = Some(policy);
+        self
+    }
+
+    /// Freeze Codex's own sandbox policy for this and subsequent turns.
+    #[must_use]
+    pub const fn with_sandbox_policy(mut self, policy: CodexTurnSandboxPolicy) -> Self {
+        self.sandbox_policy = Some(policy);
+        self
     }
 
     /// Override the model for this and subsequent worker turns.
@@ -496,6 +526,26 @@ impl CodexTurnStartParams {
     pub fn with_client_user_message_id(mut self, id: impl Into<String>) -> Self {
         self.client_user_message_id = Some(id.into());
         self
+    }
+}
+
+/// Turn-scoped Codex sandbox policy used as defense in depth after tools are removed.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CodexTurnSandboxPolicy {
+    /// Deny filesystem mutation and network access in any accidentally exposed environment.
+    #[serde(rename_all = "camelCase")]
+    ReadOnly {
+        /// Whether an environment may reach the network.
+        network_access: bool,
+    },
+}
+
+impl CodexTurnSandboxPolicy {
+    /// Construct the strict turn sandbox used by Hermes-supervised workers.
+    #[must_use]
+    pub const fn hermes_read_only() -> Self {
+        Self::ReadOnly { network_access: false }
     }
 }
 

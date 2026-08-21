@@ -25,8 +25,8 @@ pub use protocol::{
     CodexInitializeParams, CodexInitializeResponse, CodexNotification, CodexRequestId,
     CodexSandboxMode, CodexServerRequest, CodexThread, CodexThreadOpenResponse,
     CodexThreadResumeParams, CodexThreadStartParams, CodexTurn, CodexTurnCompleted,
-    CodexTurnInterruptParams, CodexTurnStartParams, CodexTurnStartResponse, CodexTurnStarted,
-    CodexTurnStatus,
+    CodexTurnInterruptParams, CodexTurnSandboxPolicy, CodexTurnStartParams, CodexTurnStartResponse,
+    CodexTurnStarted, CodexTurnStatus,
 };
 use protocol::{
     InboundMessage, OutboundErrorResponse, OutboundNotification, OutboundRequest, OutboundResponse,

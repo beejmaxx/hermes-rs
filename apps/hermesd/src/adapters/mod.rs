@@ -22,8 +22,8 @@ pub use codex::{
     CodexInitializeResponse, CodexNotification, CodexRequestId, CodexSandboxMode,
     CodexServerRequest, CodexThread, CodexThreadOpenResponse, CodexThreadResumeParams,
     CodexThreadStartParams, CodexTurn, CodexTurnCompleted, CodexTurnEngine,
-    CodexTurnInterruptParams, CodexTurnStartParams, CodexTurnStartResponse, CodexTurnStarted,
-    CodexTurnStatus, CodexWorkerBinding, dynamic_tools_from_catalog,
+    CodexTurnInterruptParams, CodexTurnSandboxPolicy, CodexTurnStartParams, CodexTurnStartResponse,
+    CodexTurnStarted, CodexTurnStatus, CodexWorkerBinding, dynamic_tools_from_catalog,
 };
 pub use local_tools::{LocalToolsConfigError, ReadOnlyLocalTools};
 pub use openai::{OpenAiCompatibleProvider, OpenAiProviderConfigError};
