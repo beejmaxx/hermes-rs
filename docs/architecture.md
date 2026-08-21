@@ -92,6 +92,13 @@ compatibility, but adapters cannot mint or replace it. A later contract
 revision can change the allocation scheme without confusing provider identity
 with durable effect identity.
 
+Every cognitive engine crosses the same `ToolHost` boundary. `ToolHost` owns
+invocation allocation and validates plan, approval, and terminal transitions;
+the direct provider loop and supervised external workers do not get separate
+effect semantics. The journal decorator also validates kernel identities
+before writing a plan, so a malformed adapter cannot poison the durable ledger
+before the host rejects it.
+
 The durable proof currently covers:
 
 1. create an immutable session lineage and prompt manifest;

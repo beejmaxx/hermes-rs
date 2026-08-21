@@ -63,6 +63,8 @@ where
         invocation_ids: &[InvocationId],
     ) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
         let plans = self.inner.plan(calls, invocation_ids)?;
+        validate_plans(calls, invocation_ids, &plans)
+            .map_err(|error| ToolBrokerError::new(error.to_string()))?;
         self.ledger
             .record_plans(&self.execution_scope, &plans)
             .map_err(|error| ToolBrokerError::new(error.to_string()))?;
@@ -100,6 +102,61 @@ where
             Ok(terminals)
         }
         .boxed()
+    }
+}
+
+/// Kernel-owned planning, approval, and execution boundary shared by turn engines.
+pub struct ToolHost<'a, T>
+where
+    T: ToolBroker + ?Sized,
+{
+    tools: &'a mut T,
+    execution_scope: String,
+    seen_invocation_ids: HashSet<InvocationId>,
+}
+
+impl<'a, T> ToolHost<'a, T>
+where
+    T: ToolBroker + ?Sized,
+{
+    /// Bind one broker to the immutable execution scope for a complete turn.
+    pub fn new(tools: &'a mut T, execution_scope: impl Into<String>) -> Result<Self, RuntimeError> {
+        let execution_scope = execution_scope.into();
+        if execution_scope.is_empty() {
+            return Err(RuntimeError::InvalidTurn(
+                "tool host execution scope must be non-empty".into(),
+            ));
+        }
+        Ok(Self { tools, execution_scope, seen_invocation_ids: HashSet::new() })
+    }
+
+    /// Allocate kernel invocation identities and obtain complete ordered frozen plans.
+    pub fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, RuntimeError> {
+        let invocation_ids =
+            allocate_invocation_ids(&self.execution_scope, calls, &mut self.seen_invocation_ids)?;
+        let planned = self.tools.plan(calls, &invocation_ids)?;
+        validate_plans(calls, &invocation_ids, &planned)?;
+        Ok(planned)
+    }
+
+    /// Resolve pending approvals without allowing mutation of a frozen plan.
+    pub async fn resolve_approvals(
+        &mut self,
+        planned: &[PlannedToolCall],
+    ) -> Result<Vec<PlannedToolCall>, RuntimeError> {
+        let resolved = self.tools.resolve_approvals(planned).await?;
+        validate_approval_resolution(planned, &resolved)?;
+        Ok(resolved)
+    }
+
+    /// Dispatch a resolved batch and validate every terminal against its frozen plan.
+    pub async fn execute(
+        &mut self,
+        resolved: &[PlannedToolCall],
+    ) -> Result<Vec<ToolTerminal>, RuntimeError> {
+        let completed = self.tools.execute(resolved).await?;
+        validate_terminals(resolved, &completed)?;
+        Ok(completed)
     }
 }
 
@@ -282,7 +339,7 @@ where
     let mut events = PublicEventLog::new(observer);
     let mut usage = Usage::default();
     let mut attempt_count = 0_usize;
-    let mut seen_invocation_ids = HashSet::new();
+    let mut tool_host = ToolHost::new(tools, execution_scope)?;
 
     let terminal_outcome = loop {
         attempt_count += 1;
@@ -509,8 +566,6 @@ where
                 }
 
                 let calls = finish_tool_calls(partial_calls)?;
-                let invocation_ids =
-                    allocate_invocation_ids(&execution_scope, &calls, &mut seen_invocation_ids)?;
                 let assistant = provider_tool_request(&text, &reasoning, &calls, provider_data)?;
                 raw_messages.push(assistant.clone());
                 persistence_intents.push(json!({
@@ -518,8 +573,7 @@ where
                     "message": serde_json::to_value(&assistant)?,
                 }));
 
-                let planned = tools.plan(&calls, &invocation_ids)?;
-                validate_plans(&calls, &invocation_ids, &planned)?;
+                let planned = tool_host.plan(&calls)?;
                 for call in &planned {
                     if let Some(approval) = &call.approval {
                         let mut request = json!({
@@ -537,8 +591,7 @@ where
                         events.push(request)?;
                     }
                 }
-                let resolved = tools.resolve_approvals(&planned).await?;
-                validate_approval_resolution(&planned, &resolved)?;
+                let resolved = tool_host.resolve_approvals(&planned).await?;
                 for call in &resolved {
                     persistence_intents.push(planned_intent(call));
                     if let Some(approval) = &call.approval {
@@ -563,8 +616,7 @@ where
                     }
                 }
 
-                let completed = tools.execute(&resolved).await?;
-                validate_terminals(&resolved, &completed)?;
+                let completed = tool_host.execute(&resolved).await?;
                 let terminals_by_id = completed
                     .iter()
                     .map(|terminal| (terminal.call_id.clone(), terminal))
