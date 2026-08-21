@@ -145,7 +145,7 @@ pub struct ChatCompletionsRequest {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTurnRequest {
-    /// Stable execution scope used to derive tool execution keys.
+    /// Stable execution scope used by the v1 kernel invocation-ID allocator.
     pub execution_scope: String,
     /// Provider transport selected for the turn.
     pub transport: TransportKind,

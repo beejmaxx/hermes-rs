@@ -21,6 +21,6 @@ pub use effect::{ApprovalRecord, PlannedToolCall, ToolEffect, ToolTerminal};
 pub use foreground::{ForegroundTurnSpec, ForegroundTurnState, ForegroundTurnTerminal};
 pub use id::{
     CompletionEventId, DelegationId, DelegationWorkerId, DeliveryClaimId, FencingToken,
-    ForegroundTurnId, IdError, LineageId, OwnerGeneration, SessionId, ToolCallId,
+    ForegroundTurnId, IdError, InvocationId, LineageId, OwnerGeneration, SessionId, ToolCallId,
 };
 pub use prompt::{EngineId, ManifestDigest, PromptManifest, PromptManifestError};

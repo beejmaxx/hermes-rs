@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use domain::{
-    Conversation, ConversationError, IdError, PlannedToolCall, SemanticMessage, ToolArguments,
-    ToolCall, ToolCallId, ToolResult, ToolResultStatus, ToolTerminal,
+    Conversation, ConversationError, IdError, InvocationId, PlannedToolCall, SemanticMessage,
+    ToolArguments, ToolCall, ToolCallId, ToolResult, ToolResultStatus, ToolTerminal,
 };
 use futures_util::StreamExt;
 use futures_util::{FutureExt, future::BoxFuture};
@@ -57,8 +57,12 @@ where
     B: ToolBroker,
     L: EffectLedger,
 {
-    fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
-        let plans = self.inner.plan(calls)?;
+    fn plan(
+        &mut self,
+        calls: &[ToolCall],
+        invocation_ids: &[InvocationId],
+    ) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
+        let plans = self.inner.plan(calls, invocation_ids)?;
         self.ledger
             .record_plans(&self.execution_scope, &plans)
             .map_err(|error| ToolBrokerError::new(error.to_string()))?;
@@ -257,7 +261,7 @@ where
     validate_request(&request)?;
 
     let AgentTurnRequest {
-        execution_scope: _,
+        execution_scope,
         transport,
         model,
         system_prompt,
@@ -278,6 +282,7 @@ where
     let mut events = PublicEventLog::new(observer);
     let mut usage = Usage::default();
     let mut attempt_count = 0_usize;
+    let mut seen_invocation_ids = HashSet::new();
 
     let terminal_outcome = loop {
         attempt_count += 1;
@@ -504,6 +509,8 @@ where
                 }
 
                 let calls = finish_tool_calls(partial_calls)?;
+                let invocation_ids =
+                    allocate_invocation_ids(&execution_scope, &calls, &mut seen_invocation_ids)?;
                 let assistant = provider_tool_request(&text, &reasoning, &calls, provider_data)?;
                 raw_messages.push(assistant.clone());
                 persistence_intents.push(json!({
@@ -511,8 +518,8 @@ where
                     "message": serde_json::to_value(&assistant)?,
                 }));
 
-                let planned = tools.plan(&calls)?;
-                validate_plans(&calls, &planned)?;
+                let planned = tools.plan(&calls, &invocation_ids)?;
+                validate_plans(&calls, &invocation_ids, &planned)?;
                 for call in &planned {
                     if let Some(approval) = &call.approval {
                         let mut request = json!({
@@ -545,13 +552,13 @@ where
                         persistence_intents.push(json!({
                             "type": "tool_started",
                             "call_id": call.call_id,
-                            "execution_key": call.execution_key,
+                            "execution_key": call.invocation_id.as_str(),
                         }));
                         events.push(json!({
                             "type": "tool.start",
                             "call_id": call.call_id,
                             "name": call.name,
-                            "execution_key": call.execution_key,
+                            "execution_key": call.invocation_id.as_str(),
                         }))?;
                     }
                 }
@@ -569,7 +576,7 @@ where
                         "call_id": terminal.call_id,
                         "name": terminal.name,
                         "status": status_name(terminal.status),
-                        "execution_key": terminal.execution_key,
+                        "execution_key": terminal.invocation_id.as_str(),
                     }))?;
                 }
 
@@ -596,7 +603,7 @@ where
                         "name": terminal.name,
                         "status": status_name(terminal.status),
                         "content": terminal.content,
-                        "execution_key": terminal.execution_key,
+                        "execution_key": terminal.invocation_id.as_str(),
                     })).collect::<Vec<_>>(),
                 }));
                 events.push(json!({
@@ -782,12 +789,39 @@ fn provider_tool_request(
     })
 }
 
-fn validate_plans(calls: &[ToolCall], plans: &[PlannedToolCall]) -> Result<(), RuntimeError> {
+fn allocate_invocation_ids(
+    execution_scope: &str,
+    calls: &[ToolCall],
+    seen: &mut HashSet<InvocationId>,
+) -> Result<Vec<InvocationId>, RuntimeError> {
+    calls
+        .iter()
+        .map(|call| {
+            let invocation_id =
+                InvocationId::new(format!("{execution_scope}:{}", call.id.as_str()))?;
+            if !seen.insert(invocation_id.clone()) {
+                return Err(RuntimeError::InvalidTurn(format!(
+                    "provider reused tool call id {} within one turn",
+                    call.id
+                )));
+            }
+            Ok(invocation_id)
+        })
+        .collect()
+}
+
+fn validate_plans(
+    calls: &[ToolCall],
+    invocation_ids: &[InvocationId],
+    plans: &[PlannedToolCall],
+) -> Result<(), RuntimeError> {
     let call_ids = calls.iter().map(|call| &call.id).collect::<Vec<_>>();
     let plan_ids = plans.iter().map(|plan| &plan.call_id).collect::<Vec<_>>();
-    if call_ids != plan_ids {
+    let plan_invocation_ids = plans.iter().map(|plan| &plan.invocation_id).collect::<Vec<_>>();
+    let expected_invocation_ids = invocation_ids.iter().collect::<Vec<_>>();
+    if call_ids != plan_ids || expected_invocation_ids != plan_invocation_ids {
         return Err(RuntimeError::InvalidTurn(
-            "tool plans must be complete and ordered like model calls".into(),
+            "tool plans must preserve kernel invocation identities and model-call order".into(),
         ));
     }
     Ok(())
@@ -806,7 +840,7 @@ fn validate_approval_resolution(
         if planned.call_id != resolved.call_id
             || planned.name != resolved.name
             || planned.arguments != resolved.arguments
-            || planned.execution_key != resolved.execution_key
+            || planned.invocation_id != resolved.invocation_id
             || planned.effect != resolved.effect
         {
             return Err(RuntimeError::InvalidTurn(
@@ -842,12 +876,33 @@ fn validate_terminals(
     plans: &[PlannedToolCall],
     terminals: &[ToolTerminal],
 ) -> Result<(), RuntimeError> {
-    let expected = plans.iter().map(|plan| &plan.call_id).collect::<HashSet<_>>();
-    let actual = terminals.iter().map(|terminal| &terminal.call_id).collect::<HashSet<_>>();
-    if expected != actual || terminals.len() != plans.len() {
+    if terminals.len() != plans.len() {
         return Err(RuntimeError::InvalidTurn(
             "tool terminals must contain each planned call exactly once".into(),
         ));
+    }
+    let plans_by_id = plans.iter().map(|plan| (&plan.call_id, plan)).collect::<HashMap<_, _>>();
+    let mut actual = HashSet::with_capacity(terminals.len());
+    for terminal in terminals {
+        if !actual.insert(&terminal.call_id) {
+            return Err(RuntimeError::InvalidTurn(
+                "tool terminals must contain each planned call exactly once".into(),
+            ));
+        }
+        let plan = plans_by_id.get(&terminal.call_id).ok_or_else(|| {
+            RuntimeError::InvalidTurn(format!(
+                "tool terminal {} has no matching plan",
+                terminal.call_id
+            ))
+        })?;
+        if terminal.name != plan.name
+            || terminal.invocation_id != plan.invocation_id
+            || terminal.effect != plan.effect
+        {
+            return Err(RuntimeError::InvalidTurn(
+                "tool terminal mutated a frozen tool plan".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -858,7 +913,7 @@ fn planned_intent(call: &PlannedToolCall) -> Value {
         ("call_id".into(), json!(call.call_id)),
         ("name".into(), json!(call.name)),
         ("arguments".into(), json!(call.arguments)),
-        ("execution_key".into(), json!(call.execution_key)),
+        ("execution_key".into(), json!(call.invocation_id.as_str())),
         ("effect".into(), json!(call.effect)),
     ]);
     if let Some(approval) = &call.approval {
@@ -871,7 +926,7 @@ fn terminal_intent(terminal: &ToolTerminal) -> Value {
     let mut value = Map::from_iter([
         ("type".into(), json!(format!("tool_{}", status_name(terminal.status)))),
         ("call_id".into(), json!(terminal.call_id)),
-        ("execution_key".into(), json!(terminal.execution_key)),
+        ("execution_key".into(), json!(terminal.invocation_id.as_str())),
         ("effect".into(), json!(terminal.effect)),
         ("content".into(), json!(terminal.content)),
     ]);
@@ -886,7 +941,7 @@ fn provider_tool_result(terminal: &ToolTerminal) -> Result<ProviderMessage, Runt
         terminal.content.clone()
     } else {
         let payload = BTreeMap::from([
-            ("execution_key", json!(terminal.execution_key)),
+            ("execution_key", json!(terminal.invocation_id.as_str())),
             ("message", json!(terminal.content)),
             ("status", json!(status_name(terminal.status))),
         ]);
@@ -896,7 +951,7 @@ fn provider_tool_result(terminal: &ToolTerminal) -> Result<ProviderMessage, Runt
         tool_call_id: terminal.call_id.as_str().to_owned(),
         status: status_name(terminal.status).into(),
         content,
-        execution_key: terminal.execution_key.clone(),
+        execution_key: terminal.invocation_id.as_str().to_owned(),
     })
 }
 
@@ -1006,11 +1061,56 @@ mod tests {
     use std::collections::BTreeMap;
 
     use domain::{
-        SemanticMessage, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolResultStatus,
+        InvocationId, PlannedToolCall, SemanticMessage, ToolArguments, ToolCall, ToolCallId,
+        ToolEffect, ToolResult, ToolResultStatus,
     };
     use serde_json::json;
 
-    use super::{project_conversation, semanticize};
+    use super::{allocate_invocation_ids, project_conversation, semanticize, validate_plans};
+
+    #[test]
+    fn broker_cannot_replace_a_kernel_invocation_identity() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let call = ToolCall {
+            id: ToolCallId::new("provider-call")?,
+            name: "read_file".into(),
+            arguments: ToolArguments(BTreeMap::new()),
+        };
+        let invocation_id = InvocationId::new("turn:invocation:1")?;
+        let plan = PlannedToolCall {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            invocation_id: InvocationId::new("broker-substitution")?,
+            effect: ToolEffect::ReadOnly,
+            approval: None,
+        };
+
+        let error = match validate_plans(&[call], &[invocation_id], &[plan]) {
+            Ok(()) => return Err("a broker replaced a kernel invocation identity".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("kernel invocation identities"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_tool_call_ids_cannot_be_reused_within_a_turn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let call = ToolCall {
+            id: ToolCallId::new("provider-call")?,
+            name: "read_file".into(),
+            arguments: ToolArguments(BTreeMap::new()),
+        };
+        let mut seen = std::collections::HashSet::new();
+        allocate_invocation_ids("turn", std::slice::from_ref(&call), &mut seen)?;
+        let error = match allocate_invocation_ids("turn", &[call], &mut seen) {
+            Ok(_) => return Err("provider identity reuse did not fail closed".into()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("reused tool call id"));
+        Ok(())
+    }
 
     #[test]
     fn semantic_projection_round_trips_a_tool_turn() -> Result<(), Box<dyn std::error::Error>> {

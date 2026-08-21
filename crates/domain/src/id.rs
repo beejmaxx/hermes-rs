@@ -84,6 +84,7 @@ opaque_id!(SessionId, "A runtime session identifier.", "session id");
 opaque_id!(LineageId, "An immutable conversation lineage identifier.", "lineage id");
 opaque_id!(ForegroundTurnId, "A durable foreground-turn attempt identifier.", "foreground turn id");
 opaque_id!(ToolCallId, "A model-issued tool invocation identifier.", "tool call id");
+opaque_id!(InvocationId, "A kernel-issued identity for one planned tool effect.", "invocation id");
 opaque_id!(DelegationId, "A durable background-delegation identifier.", "delegation id");
 opaque_id!(
     DelegationWorkerId,

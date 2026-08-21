@@ -10,7 +10,8 @@ use std::{
 };
 
 use domain::{
-    PlannedToolCall, ToolArguments, ToolCall, ToolEffect, ToolResultStatus, ToolTerminal,
+    InvocationId, PlannedToolCall, ToolArguments, ToolCall, ToolEffect, ToolResultStatus,
+    ToolTerminal,
 };
 use futures_util::{FutureExt, future::BoxFuture};
 use globset::{Glob, GlobMatcher};
@@ -80,7 +81,6 @@ pub enum LocalToolsConfigError {
 /// Broker exposing only root-confined `read_file` and `search_files`.
 pub struct ReadOnlyLocalTools {
     root: PathBuf,
-    execution_scope: String,
 }
 
 impl ReadOnlyLocalTools {
@@ -103,7 +103,7 @@ impl ReadOnlyLocalTools {
         if execution_scope.is_empty() {
             return Err(LocalToolsConfigError::EmptyExecutionScope);
         }
-        Ok(Self { root, execution_scope })
+        Ok(Self { root })
     }
 
     /// Canonical filesystem root visible to this broker.
@@ -135,7 +135,7 @@ impl ReadOnlyLocalTools {
             name: call.name.clone(),
             status,
             content,
-            execution_key: call.execution_key.clone(),
+            invocation_id: call.invocation_id.clone(),
             effect: ToolEffect::ReadOnly,
             receipt: None,
         }
@@ -305,11 +305,21 @@ impl ReadOnlyLocalTools {
 }
 
 impl ToolBroker for ReadOnlyLocalTools {
-    fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
+    fn plan(
+        &mut self,
+        calls: &[ToolCall],
+        invocation_ids: &[InvocationId],
+    ) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
+        if calls.len() != invocation_ids.len() {
+            return Err(ToolBrokerError::new(
+                "kernel invocation identities must align with model calls",
+            ));
+        }
         let mut seen = HashSet::with_capacity(calls.len());
         calls
             .iter()
-            .map(|call| {
+            .zip(invocation_ids)
+            .map(|(call, invocation_id)| {
                 if !seen.insert(&call.id) {
                     return Err(ToolBrokerError::new(format!(
                         "duplicate tool call id {}",
@@ -320,7 +330,7 @@ impl ToolBroker for ReadOnlyLocalTools {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
-                    execution_key: format!("{}:{}", self.execution_scope, call.id),
+                    invocation_id: invocation_id.clone(),
                     effect: ToolEffect::ReadOnly,
                     approval: None,
                 })
@@ -515,7 +525,7 @@ const fn default_search_results() -> usize {
 mod tests {
     use std::fs;
 
-    use domain::{ToolArguments, ToolCall, ToolCallId, ToolResultStatus};
+    use domain::{InvocationId, ToolArguments, ToolCall, ToolCallId, ToolResultStatus};
     use futures_executor::block_on;
     use ports::ToolBroker;
     use serde_json::json;
@@ -537,7 +547,7 @@ mod tests {
         tools: &mut ReadOnlyLocalTools,
         call: ToolCall,
     ) -> Result<domain::ToolTerminal, Box<dyn std::error::Error>> {
-        let plans = tools.plan(&[call])?;
+        let plans = tools.plan(&[call], &[InvocationId::new("test:invocation")?])?;
         let mut terminals = block_on(tools.execute(&plans))?;
         terminals.pop().ok_or_else(|| "missing terminal".into())
     }

@@ -3,7 +3,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{ToolArguments, ToolCallId, ToolResultStatus};
+use crate::{InvocationId, ToolArguments, ToolCallId, ToolResultStatus};
 
 /// Observable side-effect class used by approval and replay policy.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -59,8 +59,8 @@ pub struct PlannedToolCall {
     pub name: String,
     /// Validated call arguments.
     pub arguments: ToolArguments,
-    /// Stable per-invocation deduplication identity.
-    pub execution_key: String,
+    /// Kernel-issued durable identity for this planned effect.
+    pub invocation_id: InvocationId,
     /// Effect classification used by approval and replay policy.
     pub effect: ToolEffect,
     /// Approval record when policy required a decision.
@@ -80,8 +80,8 @@ pub struct ToolTerminal {
     pub status: ToolResultStatus,
     /// Human- and provider-visible result payload.
     pub content: String,
-    /// Stable per-invocation deduplication identity.
-    pub execution_key: String,
+    /// Kernel-issued durable identity copied from the plan.
+    pub invocation_id: InvocationId,
     /// Effect classification copied from the plan.
     pub effect: ToolEffect,
     /// Optional receipt supplied by a successful implementation.

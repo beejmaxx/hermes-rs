@@ -84,6 +84,14 @@ without guessing whether they are safe to retry. The API key value is never
 persisted; only the name of its credential environment variable is part of
 session configuration.
 
+Provider `ToolCallId` values are correlation metadata, not execution
+authority. Before planning, the runtime issues a typed `InvocationId`; tool
+brokers must preserve it through approval, dispatch, and the effect ledger.
+The v1 wire representation remains `execution_scope:tool_call_id` for contract
+compatibility, but adapters cannot mint or replace it. A later contract
+revision can change the allocation scheme without confusing provider identity
+with durable effect identity.
+
 The durable proof currently covers:
 
 1. create an immutable session lineage and prompt manifest;

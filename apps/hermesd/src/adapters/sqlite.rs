@@ -314,10 +314,10 @@ impl EffectLedger for SqliteEffectLedger {
         }
         let mut keys = HashSet::with_capacity(plans.len());
         for plan in plans {
-            if !keys.insert(&plan.execution_key) {
+            if !keys.insert(&plan.invocation_id) {
                 return Err(EffectLedgerError::Invalid(format!(
                     "duplicate execution key in plan batch: {}",
-                    plan.execution_key
+                    plan.invocation_id
                 )));
             }
         }
@@ -330,14 +330,16 @@ impl EffectLedger for SqliteEffectLedger {
             let exists = transaction
                 .query_row(
                     "SELECT 1 FROM tool_effects WHERE execution_key = ?1",
-                    params![plan.execution_key],
+                    params![plan.invocation_id.as_str()],
                     |row| row.get::<_, u8>(0),
                 )
                 .optional()
                 .map_err(ledger_storage_error)?
                 .is_some();
             if exists {
-                return Err(EffectLedgerError::AlreadyRecorded(plan.execution_key.clone()));
+                return Err(EffectLedgerError::AlreadyRecorded(
+                    plan.invocation_id.as_str().to_owned(),
+                ));
             }
         }
         {
@@ -352,7 +354,7 @@ impl EffectLedger for SqliteEffectLedger {
             for plan in plans {
                 insert
                     .execute(params![
-                        plan.execution_key,
+                        plan.invocation_id.as_str(),
                         execution_scope,
                         plan.call_id.as_str(),
                         plan.name,
@@ -386,17 +388,17 @@ impl EffectLedger for SqliteEffectLedger {
             .map_err(ledger_storage_error)?;
         let mut pending_updates = Vec::new();
         for plan in resolved_plans {
-            if !keys.insert(&plan.execution_key) {
+            if !keys.insert(&plan.invocation_id) {
                 return Err(EffectLedgerError::Invalid(format!(
                     "duplicate execution key in approval batch: {}",
-                    plan.execution_key
+                    plan.invocation_id
                 )));
             }
             let recorded = transaction
                 .query_row(
                     "SELECT status, call_id, name, arguments_json, effect_json, approval_json
                      FROM tool_effects WHERE execution_key = ?1",
-                    params![plan.execution_key],
+                    params![plan.invocation_id.as_str()],
                     |row| {
                         Ok(RawApprovalPlan {
                             status: row.get(0)?,
@@ -410,9 +412,13 @@ impl EffectLedger for SqliteEffectLedger {
                 )
                 .optional()
                 .map_err(ledger_storage_error)?
-                .ok_or_else(|| EffectLedgerError::MissingPlan(plan.execution_key.clone()))?;
+                .ok_or_else(|| {
+                    EffectLedgerError::MissingPlan(plan.invocation_id.as_str().to_owned())
+                })?;
             if recorded.status != "planned" {
-                return Err(EffectLedgerError::AlreadyTerminal(plan.execution_key.clone()));
+                return Err(EffectLedgerError::AlreadyTerminal(
+                    plan.invocation_id.as_str().to_owned(),
+                ));
             }
             let arguments = serde_json::from_str::<ToolArguments>(&recorded.arguments_json)
                 .map_err(|error| EffectLedgerError::Invalid(error.to_string()))?;
@@ -423,7 +429,9 @@ impl EffectLedger for SqliteEffectLedger {
                 || arguments != plan.arguments
                 || effect != plan.effect
             {
-                return Err(EffectLedgerError::PlanMismatch(plan.execution_key.clone()));
+                return Err(EffectLedgerError::PlanMismatch(
+                    plan.invocation_id.as_str().to_owned(),
+                ));
             }
             let before = recorded
                 .approval_json
@@ -439,15 +447,21 @@ impl EffectLedger for SqliteEffectLedger {
                         || before.required != after.required
                         || before.principal != after.principal
                     {
-                        return Err(EffectLedgerError::PlanMismatch(plan.execution_key.clone()));
+                        return Err(EffectLedgerError::PlanMismatch(
+                            plan.invocation_id.as_str().to_owned(),
+                        ));
                     }
                     pending_updates.push((
-                        plan.execution_key.clone(),
+                        plan.invocation_id.as_str().to_owned(),
                         serde_json::to_string(after).map_err(ledger_storage_error)?,
                     ));
                 }
                 (Some(before), Some(after)) if &before == after => {}
-                _ => return Err(EffectLedgerError::PlanMismatch(plan.execution_key.clone())),
+                _ => {
+                    return Err(EffectLedgerError::PlanMismatch(
+                        plan.invocation_id.as_str().to_owned(),
+                    ));
+                }
             }
         }
         for (execution_key, approval_json) in pending_updates {
@@ -471,10 +485,10 @@ impl EffectLedger for SqliteEffectLedger {
         }
         let mut keys = HashSet::with_capacity(terminals.len());
         for terminal in terminals {
-            if !keys.insert(&terminal.execution_key) {
+            if !keys.insert(&terminal.invocation_id) {
                 return Err(EffectLedgerError::Invalid(format!(
                     "duplicate execution key in terminal batch: {}",
-                    terminal.execution_key
+                    terminal.invocation_id
                 )));
             }
         }
@@ -488,7 +502,7 @@ impl EffectLedger for SqliteEffectLedger {
                 .query_row(
                     "SELECT status, call_id, name, effect_json
                      FROM tool_effects WHERE execution_key = ?1",
-                    params![terminal.execution_key],
+                    params![terminal.invocation_id.as_str()],
                     |row| {
                         Ok(RecordedPlan {
                             status: row.get(0)?,
@@ -500,9 +514,13 @@ impl EffectLedger for SqliteEffectLedger {
                 )
                 .optional()
                 .map_err(ledger_storage_error)?
-                .ok_or_else(|| EffectLedgerError::MissingPlan(terminal.execution_key.clone()))?;
+                .ok_or_else(|| {
+                    EffectLedgerError::MissingPlan(terminal.invocation_id.as_str().to_owned())
+                })?;
             if recorded.status != "planned" {
-                return Err(EffectLedgerError::AlreadyTerminal(terminal.execution_key.clone()));
+                return Err(EffectLedgerError::AlreadyTerminal(
+                    terminal.invocation_id.as_str().to_owned(),
+                ));
             }
             let effect = serde_json::from_str::<ToolEffect>(&recorded.effect_json)
                 .map_err(|error| EffectLedgerError::Invalid(error.to_string()))?;
@@ -510,7 +528,9 @@ impl EffectLedger for SqliteEffectLedger {
                 || recorded.name != terminal.name
                 || effect != terminal.effect
             {
-                return Err(EffectLedgerError::PlanMismatch(terminal.execution_key.clone()));
+                return Err(EffectLedgerError::PlanMismatch(
+                    terminal.invocation_id.as_str().to_owned(),
+                ));
             }
         }
         {
@@ -527,11 +547,13 @@ impl EffectLedger for SqliteEffectLedger {
                         terminal_status_name(terminal.status),
                         terminal.content,
                         terminal.receipt,
-                        terminal.execution_key,
+                        terminal.invocation_id.as_str(),
                     ])
                     .map_err(ledger_storage_error)?;
                 if updated != 1 {
-                    return Err(EffectLedgerError::AlreadyTerminal(terminal.execution_key.clone()));
+                    return Err(EffectLedgerError::AlreadyTerminal(
+                        terminal.invocation_id.as_str().to_owned(),
+                    ));
                 }
             }
         }
@@ -571,7 +593,8 @@ impl EffectLedger for SqliteEffectLedger {
                     name: row.name,
                     arguments: serde_json::from_str::<ToolArguments>(&row.arguments_json)
                         .map_err(|error| EffectLedgerError::Invalid(error.to_string()))?,
-                    execution_key: row.execution_key,
+                    invocation_id: domain::InvocationId::new(row.execution_key)
+                        .map_err(|error| EffectLedgerError::Invalid(error.to_string()))?,
                     effect: serde_json::from_str::<ToolEffect>(&row.effect_json)
                         .map_err(|error| EffectLedgerError::Invalid(error.to_string()))?,
                     approval: row
@@ -1042,9 +1065,9 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use domain::{
-        ApprovalRecord, EngineId, LineageId, ManifestDigest, OwnerGeneration, PlannedToolCall,
-        PromptManifest, SemanticMessage, SessionId, ToolArguments, ToolCallId, ToolEffect,
-        ToolResultStatus, ToolTerminal,
+        ApprovalRecord, EngineId, InvocationId, LineageId, ManifestDigest, OwnerGeneration,
+        PlannedToolCall, PromptManifest, SemanticMessage, SessionId, ToolArguments, ToolCallId,
+        ToolEffect, ToolResultStatus, ToolTerminal,
     };
     use ports::{EffectLedger, EffectLedgerError, SessionStore, SessionStoreError};
     use protocol::{SessionConfig, TransportKind};
@@ -1095,7 +1118,7 @@ mod tests {
             call_id: ToolCallId::new("call-read")?,
             name: "read_file".into(),
             arguments: ToolArguments(BTreeMap::from([("path".into(), json!("README.md"))])),
-            execution_key: key.into(),
+            invocation_id: InvocationId::new(key)?,
             effect: ToolEffect::ReadOnly,
             approval: None,
         })
@@ -1107,7 +1130,7 @@ mod tests {
             name: plan.name.clone(),
             status: ToolResultStatus::Succeeded,
             content: "1|hello\n".into(),
-            execution_key: plan.execution_key.clone(),
+            invocation_id: plan.invocation_id.clone(),
             effect: plan.effect,
             receipt: None,
         }

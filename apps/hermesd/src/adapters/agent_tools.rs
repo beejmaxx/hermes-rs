@@ -7,8 +7,8 @@ use std::{
 };
 
 use domain::{
-    ApprovalRecord, CompletionEventId, DelegationId, DelegationSpec, EngineId, LineageId,
-    ManifestDigest, PlannedToolCall, PromptManifest, SessionId, ToolArguments, ToolCall,
+    ApprovalRecord, CompletionEventId, DelegationId, DelegationSpec, EngineId, InvocationId,
+    LineageId, ManifestDigest, PlannedToolCall, PromptManifest, SessionId, ToolArguments, ToolCall,
     ToolCallId, ToolEffect, ToolResultStatus, ToolTerminal,
 };
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -114,7 +114,6 @@ impl AgentToolsConfig {
 pub struct AgentTools {
     local: ReadOnlyLocalTools,
     config: AgentToolsConfig,
-    execution_scope: String,
     pending_approvals: HashMap<ToolCallId, tokio::sync::oneshot::Receiver<ApprovalDecision>>,
     registered_approvals: HashSet<ToolCallId>,
 }
@@ -130,7 +129,6 @@ impl AgentTools {
         Ok(Self {
             local,
             config,
-            execution_scope,
             pending_approvals: HashMap::new(),
             registered_approvals: HashSet::new(),
         })
@@ -220,7 +218,16 @@ impl AgentTools {
 }
 
 impl ToolBroker for AgentTools {
-    fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
+    fn plan(
+        &mut self,
+        calls: &[ToolCall],
+        invocation_ids: &[InvocationId],
+    ) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
+        if calls.len() != invocation_ids.len() {
+            return Err(ToolBrokerError::new(
+                "kernel invocation identities must align with model calls",
+            ));
+        }
         let mut seen = HashSet::with_capacity(calls.len());
         let terminal_calls = calls
             .iter()
@@ -235,7 +242,8 @@ impl ToolBroker for AgentTools {
         }
         calls
             .iter()
-            .map(|call| {
+            .zip(invocation_ids)
+            .map(|(call, invocation_id)| {
                 if !seen.insert(&call.id) {
                     return Err(ToolBrokerError::new(format!(
                         "duplicate tool call id {}",
@@ -252,7 +260,7 @@ impl ToolBroker for AgentTools {
                             call_id: call.id.clone(),
                             name: call.name.clone(),
                             arguments: call.arguments.clone(),
-                            execution_key: format!("{}:{}", self.execution_scope, call.id),
+                            invocation_id: invocation_id.clone(),
                             effect: ToolEffect::ProcessControl,
                             approval: None,
                         };
@@ -278,7 +286,7 @@ impl ToolBroker for AgentTools {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
-                    execution_key: format!("{}:{}", self.execution_scope, call.id),
+                    invocation_id: invocation_id.clone(),
                     effect,
                     approval,
                 })
@@ -398,7 +406,7 @@ async fn execute_delegate(config: AgentToolsConfig, plan: PlannedToolCall) -> To
         name: plan.name,
         status,
         content,
-        execution_key: plan.execution_key,
+        invocation_id: plan.invocation_id,
         effect: ToolEffect::ModelInference,
         receipt,
     }
@@ -413,7 +421,7 @@ fn enqueue_child(
         .background_parent
         .clone()
         .ok_or_else(|| "background delegation has no parent session".to_owned())?;
-    let identity = stable_delegation_identity(&plan.execution_key);
+    let identity = stable_delegation_identity(plan.invocation_id.as_str());
     let delegation_id =
         DelegationId::new(format!("delegation-{identity}")).map_err(|error| error.to_string())?;
     let completion_event_id = CompletionEventId::new(format!("completion-{identity}"))
@@ -472,7 +480,7 @@ async fn run_child(
     plan: &PlannedToolCall,
     arguments: DelegateArgs,
 ) -> Result<(String, String), String> {
-    let child_scope = format!("{}:child", plan.execution_key);
+    let child_scope = format!("{}:child", plan.invocation_id.as_str());
     let system_prompt = child_system_prompt(&config.root, &arguments);
     let mut provider = OpenAiCompatibleProvider::new(&config.base_url, config.api_key.clone())
         .map_err(|error| format!("could not configure delegated provider: {error}"))?;
@@ -579,7 +587,7 @@ fn unix_time_ms() -> Result<u64, ports::DelegationStoreError> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use domain::{ToolArguments, ToolCall, ToolCallId, ToolEffect, ToolResultStatus};
+    use domain::{InvocationId, ToolArguments, ToolCall, ToolCallId, ToolEffect, ToolResultStatus};
     use futures_executor::block_on;
     use ports::ToolBroker;
     use serde_json::json;
@@ -619,7 +627,7 @@ mod tests {
             name: "delegate_task".into(),
             arguments: ToolArguments(BTreeMap::from([("goal".into(), json!(" padded "))])),
         }];
-        let plans = tools.plan(&calls)?;
+        let plans = tools.plan(&calls, &[InvocationId::new("parent:delegate-invalid")?])?;
         assert_eq!(plans[0].effect, ToolEffect::ModelInference);
         let terminals = block_on(tools.execute(&plans))?;
         assert_eq!(terminals[0].status, ToolResultStatus::Failed);
@@ -646,7 +654,7 @@ mod tests {
             name: "delegate_task".into(),
             arguments: ToolArguments(BTreeMap::from([("goal".into(), json!("Inspect it"))])),
         }];
-        let plans = tools.plan(&calls)?;
+        let plans = tools.plan(&calls, &[InvocationId::new("parent:delegate-hidden")?])?;
         assert_eq!(plans[0].effect, ToolEffect::ReadOnly);
         let terminals = block_on(tools.execute(&plans))?;
         assert_eq!(terminals[0].status, ToolResultStatus::Failed);

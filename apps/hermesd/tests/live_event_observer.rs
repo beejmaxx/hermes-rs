@@ -51,8 +51,9 @@ impl ToolBroker for EmptyTools {
     fn plan(
         &mut self,
         calls: &[domain::ToolCall],
+        invocation_ids: &[domain::InvocationId],
     ) -> Result<Vec<domain::PlannedToolCall>, ToolBrokerError> {
-        if calls.is_empty() {
+        if calls.is_empty() && invocation_ids.is_empty() {
             Ok(Vec::new())
         } else {
             Err(ToolBrokerError::new("unexpected tool call"))

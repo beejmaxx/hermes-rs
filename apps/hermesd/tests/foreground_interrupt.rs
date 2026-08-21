@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, time::Duration};
 
-use domain::{PlannedToolCall, ToolEffect, ToolTerminal};
+use domain::{InvocationId, PlannedToolCall, ToolEffect, ToolTerminal};
 use futures_util::{FutureExt, future::BoxFuture, stream};
 use hermesd::adapters::SqliteEffectLedger;
 use ports::{
@@ -59,6 +59,7 @@ impl ToolBroker for GatedExternalTool {
     fn plan(
         &mut self,
         calls: &[domain::ToolCall],
+        invocation_ids: &[InvocationId],
     ) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
         let call = calls
             .first()
@@ -68,7 +69,10 @@ impl ToolBroker for GatedExternalTool {
             call_id: call.id.clone(),
             name: call.name.clone(),
             arguments: call.arguments.clone(),
-            execution_key: "interrupt-scope:call-external".into(),
+            invocation_id: invocation_ids
+                .first()
+                .cloned()
+                .ok_or_else(|| ToolBrokerError::new("missing kernel invocation id"))?,
             effect: ToolEffect::ExternalMutation,
             approval: None,
         }])

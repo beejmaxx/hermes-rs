@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, process::Command};
 
-use domain::{PlannedToolCall, ToolArguments, ToolCallId, ToolEffect};
+use domain::{InvocationId, PlannedToolCall, ToolArguments, ToolCallId, ToolEffect};
 use hermesd::adapters::SqliteEffectLedger;
 use ports::EffectLedger;
 use serde_json::json;
@@ -16,7 +16,7 @@ fn pending_command_reports_a_durable_plan() -> Result<(), Box<dyn std::error::Er
         call_id: ToolCallId::new("call-read")?,
         name: "read_file".into(),
         arguments: ToolArguments(BTreeMap::from([("path".into(), json!("README.md"))])),
-        execution_key: "session:demo:generation:1:call-read".into(),
+        invocation_id: InvocationId::new("session:demo:generation:1:call-read")?,
         effect: ToolEffect::ReadOnly,
         approval: None,
     };

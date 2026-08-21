@@ -5,8 +5,8 @@ use std::pin::Pin;
 use domain::{
     CompletionEventId, DelegationAuthority, DelegationId, DelegationSpec, DelegationTerminal,
     DelegationWorkerId, DeliveryClaimId, FencingToken, ForegroundTurnId, ForegroundTurnSpec,
-    ForegroundTurnTerminal, OwnerGeneration, PlannedToolCall, SemanticMessage, SessionId, ToolCall,
-    ToolTerminal,
+    ForegroundTurnTerminal, InvocationId, OwnerGeneration, PlannedToolCall, SemanticMessage,
+    SessionId, ToolCall, ToolTerminal,
 };
 use futures_core::Stream;
 use futures_util::future::BoxFuture;
@@ -82,8 +82,15 @@ impl ToolBrokerError {
 
 /// Policy-aware tool planner and executor.
 pub trait ToolBroker: Send {
-    /// Attach effect, approval, and execution-key policy to model calls.
-    fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, ToolBrokerError>;
+    /// Attach effect and approval policy to calls under kernel-issued invocation identities.
+    ///
+    /// `invocation_ids` is complete and order-aligned with `calls`. Implementations must copy
+    /// those identities into their plans rather than deriving authority from provider call IDs.
+    fn plan(
+        &mut self,
+        calls: &[ToolCall],
+        invocation_ids: &[InvocationId],
+    ) -> Result<Vec<PlannedToolCall>, ToolBrokerError>;
 
     /// Resolve any pending approvals before effect dispatch.
     ///

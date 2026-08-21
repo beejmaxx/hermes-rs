@@ -320,7 +320,7 @@ fn terminal(
         name: plan.name,
         status,
         content,
-        execution_key: plan.execution_key,
+        invocation_id: plan.invocation_id,
         effect: ToolEffect::ProcessControl,
         receipt,
     }
@@ -334,7 +334,9 @@ const fn default_timeout_ms() -> u64 {
 mod tests {
     use std::collections::BTreeMap;
 
-    use domain::{PlannedToolCall, ToolArguments, ToolCallId, ToolEffect, ToolResultStatus};
+    use domain::{
+        InvocationId, PlannedToolCall, ToolArguments, ToolCallId, ToolEffect, ToolResultStatus,
+    };
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -345,7 +347,7 @@ mod tests {
             call_id: ToolCallId::new("call-terminal")?,
             name: TerminalTool::NAME.into(),
             arguments: ToolArguments(BTreeMap::from([("command".into(), json!(command))])),
-            execution_key: "terminal:call-terminal".into(),
+            invocation_id: InvocationId::new("terminal:call-terminal")?,
             effect: ToolEffect::ProcessControl,
             approval: None,
         })

@@ -22,7 +22,7 @@ pub fn list_pending_effects(state_override: Option<&Path>) -> anyhow::Result<()>
     for effect in pending {
         println!(
             "{}\t{}\t{}\t{}",
-            effect.plan.execution_key,
+            effect.plan.invocation_id,
             effect.execution_scope,
             effect.plan.name,
             effect_name(effect.plan.effect)

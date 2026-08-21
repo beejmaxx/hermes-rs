@@ -7,7 +7,8 @@ use std::{
 };
 
 use domain::{
-    ApprovalRecord, PlannedToolCall, ToolCall, ToolEffect, ToolResultStatus, ToolTerminal,
+    ApprovalRecord, InvocationId, PlannedToolCall, ToolCall, ToolEffect, ToolResultStatus,
+    ToolTerminal,
 };
 use futures_util::{FutureExt, future::BoxFuture, stream};
 use ports::{
@@ -245,8 +246,7 @@ pub fn scripted_agent_turn(fixture: &ContractFixture) -> Result<ScriptedAgentTur
     let input: AgentTurnFixtureInput = serde_json::from_value(fixture.input.clone())
         .map_err(|source| ScenarioError::Decode { fixture_id: fixture.id.clone(), source })?;
     let provider = ScriptedProvider::new(&fixture.id, input.provider_steps)?;
-    let tools =
-        ScriptedToolBroker { scenario_id: fixture.id.clone(), outcomes: input.tool_outcomes };
+    let tools = ScriptedToolBroker { outcomes: input.tool_outcomes };
     Ok(ScriptedAgentTurn {
         request: AgentTurnRequest {
             execution_scope: fixture.id.clone(),
@@ -344,16 +344,25 @@ impl Provider for ScriptedProvider {
 
 /// Tool broker that returns pinned outcomes without executing real effects.
 pub struct ScriptedToolBroker {
-    scenario_id: String,
     outcomes: HashMap<String, ScriptedToolOutcome>,
 }
 
 impl ToolBroker for ScriptedToolBroker {
-    fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
+    fn plan(
+        &mut self,
+        calls: &[ToolCall],
+        invocation_ids: &[InvocationId],
+    ) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
+        if calls.len() != invocation_ids.len() {
+            return Err(ToolBrokerError::new(
+                "kernel invocation identities must align with model calls",
+            ));
+        }
         let mut seen = HashSet::with_capacity(calls.len());
         calls
             .iter()
-            .map(|call| {
+            .zip(invocation_ids)
+            .map(|(call, invocation_id)| {
                 if !seen.insert(call.id.clone()) {
                     return Err(ToolBrokerError::new(format!("duplicate tool call {}", call.id)));
                 }
@@ -370,7 +379,7 @@ impl ToolBroker for ScriptedToolBroker {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
-                    execution_key: format!("{}:{}", self.scenario_id, call.id),
+                    invocation_id: invocation_id.clone(),
                     effect: outcome.effect,
                     approval: outcome.approval.clone(),
                 })
@@ -426,7 +435,7 @@ impl ToolBroker for ScriptedToolBroker {
                         name: call.name.clone(),
                         status,
                         content,
-                        execution_key: call.execution_key.clone(),
+                        invocation_id: call.invocation_id.clone(),
                         effect: call.effect,
                         receipt: outcome.receipt.clone(),
                     },
