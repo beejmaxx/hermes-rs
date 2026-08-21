@@ -2,13 +2,14 @@
 
 #![cfg(unix)]
 
-use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, path::PathBuf};
+use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
 
 use hermesd::adapters::{
     CodexAppServer, CodexAppServerCommand, CodexAppServerError, CodexAppServerEvent,
-    CodexApprovalPolicy, CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec,
-    CodexDynamicToolSpec, CodexInitializeParams, CodexNotification, CodexSandboxMode,
-    CodexThreadStartParams, CodexTurnInterruptParams, CodexTurnStartParams, CodexTurnStatus,
+    CodexApprovalPolicy, CodexAuthorityPolicy, CodexConfigReadParams, CodexDynamicToolCallResponse,
+    CodexDynamicToolFunctionSpec, CodexDynamicToolSpec, CodexInitializeParams, CodexNotification,
+    CodexSandboxMode, CodexThreadStartParams, CodexTurnInterruptParams, CodexTurnStartParams,
+    CodexTurnStatus,
 };
 use serde_json::json;
 use tempfile::{TempDir, tempdir};
@@ -39,23 +40,32 @@ require_text '"method":"initialized"'
 
 read_frame
 require_text '"id":2'
+require_text '"method":"config/read"'
+require_text '"cwd":"/tmp/fake-workspace"'
+emit '{"id":2,"result":{"config":{"mcp_servers":{"ambient.docs":{"command":"docs"}}},"origins":{},"layers":null}}'
+
+read_frame
+require_text '"id":3'
 require_text '"method":"thread/start"'
 require_text '"model":"gpt-5.6-luna"'
 require_text '"approvalPolicy":"never"'
 require_text '"sandbox":"read-only"'
-require_text '"config":{"features.shell_tool":false}'
+require_text '"environments":[]'
+require_text '"shell_tool":false'
+require_text '"multi_agent":false'
+require_text '"mcp_servers":{"ambient.docs":{"enabled":false}}'
 require_text '"dynamicTools":[{"type":"function","name":"hermes_read_file"'
 require_text '"inputSchema":{"additionalProperties":false,"properties":{"path":{"type":"string"}},"required":["path"],"type":"object"}'
 emit '{"method":"thread/started","params":{"thread":{"id":"thread-1"}}}'
-emit '{"id":2,"result":{"thread":{"id":"thread-1"},"model":"gpt-5.6-luna","modelProvider":"openai_http","cwd":"/tmp/fake-workspace","approvalPolicy":"never","sandbox":{"type":"readOnly"}}}'
+emit '{"id":3,"result":{"thread":{"id":"thread-1"},"model":"gpt-5.6-luna","modelProvider":"openai_http","cwd":"/tmp/fake-workspace","approvalPolicy":"never","sandbox":{"type":"readOnly"}}}'
 
 read_frame
-require_text '"id":3'
+require_text '"id":4'
 require_text '"method":"turn/start"'
 require_text '"threadId":"thread-1"'
 require_text '"text":"first prompt"'
 emit '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress","items":[]}}}'
-emit '{"id":3,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}'
+emit '{"id":4,"result":{"turn":{"id":"turn-1","status":"inProgress","items":[]}}}'
 emit '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"hello "}}'
 emit '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"message-1","delta":"world"}}'
 emit '{"id":"dynamic-1","method":"item/tool/call","params":{"threadId":"thread-1","turnId":"turn-1","callId":"worker-call-1","namespace":null,"tool":"hermes_read_file","arguments":{"path":"README.md"}}}'
@@ -69,17 +79,17 @@ require_text '"success":true'
 emit '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed","items":[]}}}'
 
 read_frame
-require_text '"id":4'
+require_text '"id":5'
 require_text '"method":"turn/start"'
 require_text '"text":"interrupt me"'
-emit '{"id":4,"result":{"turn":{"id":"turn-2","status":"inProgress","items":[]}}}'
+emit '{"id":5,"result":{"turn":{"id":"turn-2","status":"inProgress","items":[]}}}'
 emit '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-2","itemId":"message-2","delta":"partial"}}'
 
 read_frame
-require_text '"id":5'
+require_text '"id":6'
 require_text '"method":"turn/interrupt"'
 require_text '"turnId":"turn-2"'
-emit '{"id":5,"result":{}}'
+emit '{"id":6,"result":{}}'
 emit '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-2","status":"interrupted","items":[]}}}'
 
 if IFS= read -r line; then
@@ -113,29 +123,35 @@ fi
     client.respond(server_request.id(), &json!({"ok": true})).await?;
     client.initialized().await?;
 
+    let effective =
+        client.read_config(&CodexConfigReadParams::for_cwd("/tmp/fake-workspace")).await?;
+    let policy = CodexAuthorityPolicy::new(
+        &effective,
+        vec![CodexDynamicToolSpec::Function(CodexDynamicToolFunctionSpec::new(
+            "hermes_read_file",
+            "Read one file through Hermes.",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ))],
+    )?;
+    assert_eq!(policy.manifest().disabled_mcp_servers(), ["ambient.docs"]);
+
     let opened = client
         .start_thread(
-            &CodexThreadStartParams::new()
-                .with_model("gpt-5.6-luna")
-                .with_cwd("/tmp/fake-workspace")
-                .with_approval_policy(CodexApprovalPolicy::Never)
-                .with_sandbox(CodexSandboxMode::ReadOnly)
-                .with_base_instructions("Stay within Hermes authority.")
-                .with_developer_instructions("Use only client-hosted capabilities.")
-                .with_config(BTreeMap::from([("features.shell_tool".into(), json!(false))]))
-                .with_dynamic_tools(vec![CodexDynamicToolSpec::Function(
-                    CodexDynamicToolFunctionSpec::new(
-                        "hermes_read_file",
-                        "Read one file through Hermes.",
-                        json!({
-                            "type": "object",
-                            "properties": {"path": {"type": "string"}},
-                            "required": ["path"],
-                            "additionalProperties": false
-                        }),
-                    ),
-                )])
-                .with_ephemeral(false),
+            &policy.constrain(
+                CodexThreadStartParams::new()
+                    .with_model("gpt-5.6-luna")
+                    .with_cwd("/tmp/fake-workspace")
+                    .with_approval_policy(CodexApprovalPolicy::Never)
+                    .with_sandbox(CodexSandboxMode::ReadOnly)
+                    .with_base_instructions("Stay within Hermes authority.")
+                    .with_developer_instructions("Use only client-hosted capabilities.")
+                    .with_ephemeral(false),
+            ),
         )
         .await?;
     assert_eq!(opened.thread().id(), "thread-1");

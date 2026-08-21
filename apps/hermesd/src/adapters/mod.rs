@@ -14,10 +14,12 @@ pub use agent_tools::{AgentTools, AgentToolsConfig, AgentToolsConfigError};
 pub use approval::{ApprovalControl, ApprovalControlError, ApprovalDecision};
 pub use codex::{
     CodexAgentMessageDelta, CodexAppServer, CodexAppServerCommand, CodexAppServerError,
-    CodexAppServerEvent, CodexApprovalPolicy, CodexDynamicToolCallOutputContentItem,
-    CodexDynamicToolCallParams, CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec,
-    CodexDynamicToolSpec, CodexInitializeParams, CodexInitializeResponse, CodexNotification,
-    CodexRequestId, CodexSandboxMode, CodexServerRequest, CodexThread, CodexThreadOpenResponse,
+    CodexAppServerEvent, CodexApprovalPolicy, CodexAuthorityError, CodexAuthorityManifest,
+    CodexAuthorityPolicy, CodexConfigReadParams, CodexConfigReadResponse,
+    CodexDynamicToolCallOutputContentItem, CodexDynamicToolCallParams,
+    CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec, CodexDynamicToolSpec,
+    CodexInitializeParams, CodexInitializeResponse, CodexNotification, CodexRequestId,
+    CodexSandboxMode, CodexServerRequest, CodexThread, CodexThreadOpenResponse,
     CodexThreadResumeParams, CodexThreadStartParams, CodexTurn, CodexTurnCompleted,
     CodexTurnInterruptParams, CodexTurnStartParams, CodexTurnStartResponse, CodexTurnStarted,
     CodexTurnStatus,

@@ -1,5 +1,6 @@
 //! Supervised Codex app-server process and its typed stdio protocol subset.
 
+mod authority;
 mod protocol;
 
 use std::{
@@ -11,9 +12,10 @@ use std::{
     time::Duration,
 };
 
+pub use authority::{CodexAuthorityError, CodexAuthorityManifest, CodexAuthorityPolicy};
 pub use protocol::{
-    CodexAgentMessageDelta, CodexAppServerEvent, CodexApprovalPolicy,
-    CodexDynamicToolCallOutputContentItem, CodexDynamicToolCallParams,
+    CodexAgentMessageDelta, CodexAppServerEvent, CodexApprovalPolicy, CodexConfigReadParams,
+    CodexConfigReadResponse, CodexDynamicToolCallOutputContentItem, CodexDynamicToolCallParams,
     CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec, CodexDynamicToolSpec,
     CodexInitializeParams, CodexInitializeResponse, CodexNotification, CodexRequestId,
     CodexSandboxMode, CodexServerRequest, CodexThread, CodexThreadOpenResponse,
@@ -196,6 +198,14 @@ impl CodexAppServer {
     /// Notify the worker that initialization is complete.
     pub async fn initialized(&mut self) -> Result<(), CodexAppServerError> {
         self.write_frame(&OutboundNotification { method: "initialized" }).await
+    }
+
+    /// Read effective worker configuration for authority-policy construction.
+    pub async fn read_config(
+        &mut self,
+        params: &CodexConfigReadParams,
+    ) -> Result<CodexConfigReadResponse, CodexAppServerError> {
+        self.request("config/read", params).await
     }
 
     /// Create a new worker-owned thread.

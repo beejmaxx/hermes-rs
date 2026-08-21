@@ -94,6 +94,38 @@ impl CodexInitializeResponse {
     }
 }
 
+/// Parameters for reading the worker's effective configuration without layers or secrets output.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexConfigReadParams {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    include_layers: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+}
+
+impl CodexConfigReadParams {
+    /// Read effective configuration for the selected working directory.
+    #[must_use]
+    pub fn for_cwd(cwd: impl Into<String>) -> Self {
+        Self { include_layers: false, cwd: Some(cwd.into()) }
+    }
+}
+
+/// Effective configuration returned by `config/read`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct CodexConfigReadResponse {
+    config: BTreeMap<String, Value>,
+}
+
+impl CodexConfigReadResponse {
+    /// Return one effective top-level configuration value.
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.config.get(key)
+    }
+}
+
 /// Codex approval behavior selected for a thread.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -138,6 +170,8 @@ pub struct CodexThreadStartParams {
     config: Option<BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     dynamic_tools: Option<Vec<CodexDynamicToolSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    environments: Option<Vec<Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ephemeral: Option<bool>,
 }
@@ -205,6 +239,13 @@ impl CodexThreadStartParams {
         self
     }
 
+    /// Disable every Codex-owned execution environment for this thread.
+    #[must_use]
+    pub fn without_environments(mut self) -> Self {
+        self.environments = Some(Vec::new());
+        self
+    }
+
     /// Control whether Codex persists the new thread in its own store.
     #[must_use]
     pub const fn with_ephemeral(mut self, ephemeral: bool) -> Self {
@@ -219,6 +260,16 @@ impl CodexThreadStartParams {
 pub enum CodexDynamicToolSpec {
     /// One standalone function implemented by the Hermes host.
     Function(CodexDynamicToolFunctionSpec),
+}
+
+impl CodexDynamicToolSpec {
+    /// Model-visible tool name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Function(function) => function.name(),
+        }
+    }
 }
 
 /// Schema and model-facing documentation for one client-hosted function.
@@ -253,6 +304,12 @@ impl CodexDynamicToolFunctionSpec {
     pub const fn with_deferred_loading(mut self, defer_loading: bool) -> Self {
         self.defer_loading = defer_loading;
         self
+    }
+
+    /// Client-hosted function name visible to the worker.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
