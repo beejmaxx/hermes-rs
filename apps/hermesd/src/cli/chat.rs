@@ -16,6 +16,7 @@ use protocol::{
 use runtime::JournaledToolBroker;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 
 use crate::adapters::{
     AgentTools, AgentToolsConfig, ApprovalControl, CodexAppServerCommand, CodexEngineTurnRequest,
@@ -241,6 +242,9 @@ pub(super) struct LiveTurnOutcome {
     pub(super) worker_binding: Option<CodexWorkerBinding>,
 }
 
+/// `None` means the controlling gateway interrupted the turn before commit.
+pub(super) type LiveTurnExecution = Option<LiveTurnOutcome>;
+
 /// Canonical session authority paired for one durable engine execution.
 #[derive(Clone, Copy)]
 pub(super) struct DurableTurnRef<'a> {
@@ -262,52 +266,58 @@ pub(super) async fn execute_turn(
     state: &Path,
     durable: Option<DurableTurnRef<'_>>,
 ) -> anyhow::Result<LiveTurnOutcome> {
-    execute_turn_inner(
-        settings,
-        semantic_history,
-        prompt,
-        scope,
-        state,
-        durable,
-        TurnHooks { observer: None, approval_control: None },
+    expect_live_completion(
+        execute_turn_inner(
+            settings,
+            semantic_history,
+            prompt,
+            scope,
+            state,
+            durable,
+            TurnHooks { observer: None, approval_control: None, cancellation: None },
+        )
+        .await?,
     )
-    .await
 }
 
 /// Live gateway surfaces paired for one observed foreground turn.
 pub(super) struct ObservedTurn<'a> {
     observer: &'a mut dyn runtime::RuntimeEventObserver,
     approval_control: &'a ApprovalControl,
+    cancellation: &'a mut oneshot::Receiver<()>,
 }
 
 impl<'a> ObservedTurn<'a> {
     pub(super) fn new(
         observer: &'a mut dyn runtime::RuntimeEventObserver,
         approval_control: &'a ApprovalControl,
+        cancellation: &'a mut oneshot::Receiver<()>,
     ) -> Self {
-        Self { observer, approval_control }
+        Self { observer, approval_control, cancellation }
     }
 }
 
-pub(super) async fn execute_turn_observed(
+/// Execute a gateway turn while preserving cooperative external-worker interruption.
+pub(super) async fn execute_turn_observed_interruptible(
     settings: &LiveSettings,
     semantic_history: Vec<domain::SemanticMessage>,
     prompt: &str,
     scope: &str,
     state: &Path,
-    durable: Option<DurableTurnRef<'_>>,
+    durable: DurableTurnRef<'_>,
     observed: ObservedTurn<'_>,
-) -> anyhow::Result<LiveTurnOutcome> {
+) -> anyhow::Result<LiveTurnExecution> {
     execute_turn_inner(
         settings,
         semantic_history,
         prompt,
         scope,
         state,
-        durable,
+        Some(durable),
         TurnHooks {
             observer: Some(observed.observer),
             approval_control: Some(observed.approval_control),
+            cancellation: Some(observed.cancellation),
         },
     )
     .await
@@ -320,10 +330,11 @@ async fn execute_turn_inner(
     scope: &str,
     state: &Path,
     durable: Option<DurableTurnRef<'_>>,
-    hooks: TurnHooks<'_>,
-) -> anyhow::Result<LiveTurnOutcome> {
+    mut hooks: TurnHooks<'_>,
+) -> anyhow::Result<LiveTurnExecution> {
     let session_id = durable.map(|authority| authority.session_id);
-    let TurnHooks { observer, approval_control } = hooks;
+    let observer = hooks.observer.take();
+    let approval_control = hooks.approval_control;
     let api_key = match settings.engine {
         EnginePreset::Direct => read_api_key(settings.api_key_env.as_deref())?,
         EnginePreset::Codex => None,
@@ -372,18 +383,26 @@ async fn execute_turn_inner(
                 conversation,
                 tools: settings.tools.clone(),
             };
-            match observer {
-                Some(observer) => {
-                    runtime::run_turn_observed(request, &mut provider, &mut tools, observer)
-                        .await
-                        .map(|contract| LiveTurnOutcome { contract, worker_binding: None })
-                        .map_err(Into::into)
+            let run = async {
+                match observer {
+                    Some(observer) => {
+                        runtime::run_turn_observed(request, &mut provider, &mut tools, observer)
+                            .await
+                    }
+                    None => runtime::run_turn(request, &mut provider, &mut tools).await,
                 }
-                None => runtime::run_turn(request, &mut provider, &mut tools)
-                    .await
-                    .map(|contract| LiveTurnOutcome { contract, worker_binding: None })
-                    .map_err(Into::into),
-            }
+            };
+            let contract = match hooks.cancellation.as_deref_mut() {
+                Some(receiver) => {
+                    tokio::select! {
+                        biased;
+                        _ = receiver => return Ok(None),
+                        result = run => result?,
+                    }
+                }
+                None => run.await?,
+            };
+            Ok(Some(LiveTurnOutcome { contract, worker_binding: None }))
         }
         EnginePreset::Codex => {
             let command = settings
@@ -412,51 +431,41 @@ async fn execute_turn_inner(
                     .load_current(authority.session_id, authority.generation)?,
                 None => None,
             };
-            match observer {
-                Some(observer) => {
-                    let result = if session_id.is_some() {
-                        engine
-                            .run_bound(
-                                request,
-                                previous_binding.as_ref(),
-                                &settings.tools,
-                                &mut tools,
-                                observer,
-                            )
-                            .await
-                    } else {
-                        engine.run_new(request, &settings.tools, &mut tools, observer).await
-                    };
-                    result
-                        .map(|outcome| LiveTurnOutcome {
-                            contract: outcome.contract,
-                            worker_binding: Some(outcome.binding),
-                        })
-                        .map_err(Into::into)
-                }
-                None => {
-                    let mut observer = runtime::NoopEventObserver;
-                    let result = if session_id.is_some() {
-                        engine
-                            .run_bound(
-                                request,
-                                previous_binding.as_ref(),
-                                &settings.tools,
-                                &mut tools,
-                                &mut observer,
-                            )
-                            .await
-                    } else {
-                        engine.run_new(request, &settings.tools, &mut tools, &mut observer).await
-                    };
-                    result
-                        .map(|outcome| LiveTurnOutcome {
-                            contract: outcome.contract,
-                            worker_binding: Some(outcome.binding),
-                        })
-                        .map_err(Into::into)
-                }
-            }
+            let mut noop_observer = runtime::NoopEventObserver;
+            let observer: &mut dyn runtime::RuntimeEventObserver =
+                observer.unwrap_or(&mut noop_observer);
+            let execution = if let Some(receiver) = hooks.cancellation {
+                let _session = session_id
+                    .context("interruptible Codex execution requires a durable session")?;
+                engine
+                    .run_bound_interruptible(
+                        request,
+                        previous_binding.as_ref(),
+                        &settings.tools,
+                        &mut tools,
+                        observer,
+                        receiver,
+                    )
+                    .await?
+            } else if session_id.is_some() {
+                Some(
+                    engine
+                        .run_bound(
+                            request,
+                            previous_binding.as_ref(),
+                            &settings.tools,
+                            &mut tools,
+                            observer,
+                        )
+                        .await?,
+                )
+            } else {
+                Some(engine.run_new(request, &settings.tools, &mut tools, observer).await?)
+            };
+            Ok(execution.map(|outcome| LiveTurnOutcome {
+                contract: outcome.contract,
+                worker_binding: Some(outcome.binding),
+            }))
         }
     }
 }
@@ -482,6 +491,14 @@ pub(super) fn persist_worker_binding(
 struct TurnHooks<'a> {
     observer: Option<&'a mut dyn runtime::RuntimeEventObserver>,
     approval_control: Option<&'a ApprovalControl>,
+    cancellation: Option<&'a mut oneshot::Receiver<()>>,
+}
+
+fn expect_live_completion(execution: LiveTurnExecution) -> anyhow::Result<LiveTurnOutcome> {
+    match execution {
+        Some(outcome) => Ok(outcome),
+        None => anyhow::bail!("uncancellable live turn reported interruption"),
+    }
 }
 
 pub(super) fn completed_response(outcome: &ContractOutcome) -> anyhow::Result<&str> {

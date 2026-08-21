@@ -56,10 +56,12 @@ emitted. Provider deltas and tool lifecycle events cross a synchronous runtime
 observer boundary as they occur; the runtime also retains that exact sequence
 in its returned conformance log.
 
-`session.interrupt` cancels the live turn future, clears its in-memory ownership
+`session.interrupt` signals the live engine, clears its in-memory ownership
 before emitting a terminal `message.complete`, and leaves any tool invocation
 that was durably planned but did not reach a terminal in the effect ledger for
-operator reconciliation. It does not silently replay or discard that effect.
+operator reconciliation. Direct-provider work is dropped. A Codex worker is
+sent a bounded `turn/interrupt` request and its partial transcript and forked
+binding are discarded. Neither path silently replays or discards an effect.
 
 New gateway sessions freeze an explicitly approved `terminal` tool. Its effect
 plan is durable before `approval.request`; `approval.respond` persists the
@@ -202,8 +204,9 @@ This is a usable vertical slice, not a claim of full gateway parity:
   per-call terminal `once`/`deny`, not session or permanent policies.
 - Background-child steering, nested delegation, and replay of an ambiguous
   child outcome are not implemented.
-- Codex worker bindings are durable and crash-fenced, but graceful app-server
-  interruption is not implemented yet.
+- Codex worker interruption is cooperative and bounded once `turn/start` has
+  returned. Cancellation during worker startup closes the child because no
+  target turn identity exists yet.
 
 Unsupported methods return JSON-RPC `-32601`; the gateway does not silently
 pretend that a capability exists. These gaps define follow-up behavior slices

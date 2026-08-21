@@ -118,8 +118,10 @@ the Codex thread and last completed turn as a derived binding fenced by the
 canonical Hermes generation. Each later turn uses Codex `thread/fork` through
 that exact turn, so worker activity after the committed boundary is omitted.
 If binding persistence fails, the next turn rebuilds from the canonical Hermes
-transcript instead of treating stale worker state as truth. Graceful interrupt
-propagation remains host-integration work.
+transcript instead of treating stale worker state as truth. A gateway
+interruption sends Codex `turn/interrupt`, waits a bounded interval for the
+matching interrupted terminal, and then closes the worker. The partial worker
+tail and its forked binding never advance canonical Hermes state.
 
 The durable proof currently covers:
 

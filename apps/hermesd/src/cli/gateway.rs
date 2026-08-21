@@ -30,7 +30,7 @@ use super::{
     background::{BackgroundControl, BackgroundSupervisor},
     chat::{
         DurableTurnRef, LiveSettings, ObservedTurn, RuntimeArgs, completed_response,
-        execute_turn_observed, persist_worker_binding,
+        execute_turn_observed_interruptible, persist_worker_binding,
     },
     state::state_path,
 };
@@ -613,7 +613,7 @@ impl GatewayHost {
             }
         };
 
-        let (cancel_sender, cancel_receiver) = oneshot::channel();
+        let (cancel_sender, mut cancel_receiver) = oneshot::channel();
         if let Ok(mut controls) = self.controls.lock() {
             controls.insert(sid.as_str().to_owned(), cancel_sender);
         } else {
@@ -654,20 +654,18 @@ impl GatewayHost {
         let approval_control = self.approval_control.clone();
         self.turns.push(tokio::spawn(async move {
             writer.event("message.start", &sid, None);
-            let result = tokio::select! {
-                biased;
-                _ = cancel_receiver => None,
-                result = run_session_turn(
-                    &state,
-                    &writer,
-                    &claim,
-                    &approval_control,
-                    &settings,
-                ) => Some(result),
-            };
+            let result = run_session_turn(
+                &state,
+                &writer,
+                &claim,
+                &approval_control,
+                &settings,
+                &mut cancel_receiver,
+            )
+            .await;
             let result = match result {
-                Some(Ok(final_response)) => Ok(TurnExit::Completed(final_response)),
-                Some(Err(error)) => terminate_turn(
+                Ok(Some(final_response)) => Ok(TurnExit::Completed(final_response)),
+                Err(error) => terminate_turn(
                     &state,
                     &claim.spec.turn_id,
                     claim.owner_generation,
@@ -677,7 +675,7 @@ impl GatewayHost {
                     claim.started_at_ms,
                 )
                 .map(|_| TurnExit::Failed(format!("Error: {error}"))),
-                None => terminate_turn(
+                Ok(None) => terminate_turn(
                     &state,
                     &claim.spec.turn_id,
                     claim.owner_generation,
@@ -828,7 +826,8 @@ async fn run_session_turn(
     claim: &ForegroundTurnSnapshot,
     approval_control: &ApprovalControl,
     host_settings: &LiveSettings,
-) -> anyhow::Result<String> {
+    cancellation: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<Option<String>> {
     let session_id = &claim.spec.session_id;
     let expected_generation = claim.owner_generation;
     let mut store = SqliteSessionStore::open(state)?;
@@ -848,16 +847,19 @@ async fn run_session_turn(
         snapshot.owner_generation.get()
     );
     let mut observer = GatewayRuntimeEventObserver { writer, session_id };
-    let outcome = execute_turn_observed(
+    let execution = execute_turn_observed_interruptible(
         &settings,
         snapshot.conversation,
         &claim.provider_prompt,
         &scope,
         state,
-        Some(DurableTurnRef::new(session_id, expected_generation)),
-        ObservedTurn::new(&mut observer, approval_control),
+        DurableTurnRef::new(session_id, expected_generation),
+        ObservedTurn::new(&mut observer, approval_control, cancellation),
     )
     .await?;
+    let Some(outcome) = execution else {
+        return Ok(None);
+    };
     let final_response = completed_response(&outcome.contract)?.to_owned();
     let mut appended = outcome
         .contract
@@ -887,7 +889,7 @@ async fn run_session_turn(
         committed.owner_generation,
         outcome.worker_binding.as_ref(),
     );
-    Ok(final_response)
+    Ok(Some(final_response))
 }
 
 fn terminate_turn(

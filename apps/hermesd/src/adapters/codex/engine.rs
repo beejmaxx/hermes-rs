@@ -1,6 +1,6 @@
 //! Codex cognitive engine supervised by the Hermes runtime authority boundary.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, future::Future, path::PathBuf, time::Duration};
 
 use domain::{
     Conversation, SemanticMessage, ToolArguments, ToolCall, ToolCallId, ToolResult,
@@ -12,14 +12,18 @@ use runtime::{RuntimeError, RuntimeEventObserver, RuntimeEventObserverError, Too
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::{sync::oneshot, time::timeout};
 
 use super::{
     CodexAppServer, CodexAppServerCommand, CodexAppServerError, CodexAppServerEvent,
     CodexApprovalPolicy, CodexAuthorityError, CodexAuthorityManifest, CodexAuthorityPolicy,
     CodexConfigReadParams, CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec,
     CodexDynamicToolSpec, CodexInitializeParams, CodexNotification, CodexSandboxMode,
-    CodexThreadForkParams, CodexThreadStartParams, CodexTurnStartParams, CodexTurnStatus,
+    CodexThreadForkParams, CodexThreadStartParams, CodexTurnInterruptParams, CodexTurnStartParams,
+    CodexTurnStatus,
 };
+
+const INTERRUPT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A Codex turn could not complete inside the Hermes authority boundary.
 #[derive(Debug, Error)]
@@ -100,7 +104,16 @@ impl CodexTurnEngine {
         T: ToolBroker + ?Sized,
         O: RuntimeEventObserver + ?Sized,
     {
-        self.run_inner(request, None, false, tool_catalog, tools, observer).await
+        expect_completed(
+            self.run_inner(
+                request,
+                CodexRunControl::new(None, false, None),
+                tool_catalog,
+                tools,
+                observer,
+            )
+            .await?,
+        )
     }
 
     /// Execute a durable turn, branching from the last worker turn committed by Hermes.
@@ -116,18 +129,50 @@ impl CodexTurnEngine {
         T: ToolBroker + ?Sized,
         O: RuntimeEventObserver + ?Sized,
     {
-        self.run_inner(request, previous_binding, true, tool_catalog, tools, observer).await
+        expect_completed(
+            self.run_inner(
+                request,
+                CodexRunControl::new(previous_binding, true, None),
+                tool_catalog,
+                tools,
+                observer,
+            )
+            .await?,
+        )
+    }
+
+    /// Execute a durable turn and cooperatively interrupt the active worker when requested.
+    pub async fn run_bound_interruptible<T, O>(
+        &self,
+        request: CodexEngineTurnRequest,
+        previous_binding: Option<&CodexWorkerBinding>,
+        tool_catalog: &[Value],
+        tools: &mut T,
+        observer: &mut O,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> Result<Option<CodexEngineOutcome>, CodexEngineError>
+    where
+        T: ToolBroker + ?Sized,
+        O: RuntimeEventObserver + ?Sized,
+    {
+        self.run_inner(
+            request,
+            CodexRunControl::new(previous_binding, true, Some(cancellation)),
+            tool_catalog,
+            tools,
+            observer,
+        )
+        .await
     }
 
     async fn run_inner<T, O>(
         &self,
         request: CodexEngineTurnRequest,
-        previous_binding: Option<&CodexWorkerBinding>,
-        persist_worker_thread: bool,
+        mut control: CodexRunControl<'_>,
         tool_catalog: &[Value],
         tools: &mut T,
         observer: &mut O,
-    ) -> Result<CodexEngineOutcome, CodexEngineError>
+    ) -> Result<Option<CodexEngineOutcome>, CodexEngineError>
     where
         T: ToolBroker + ?Sized,
         O: RuntimeEventObserver + ?Sized,
@@ -141,26 +186,43 @@ impl CodexTurnEngine {
             .to_str()
             .ok_or_else(|| CodexEngineError::Invalid("worker cwd is not valid UTF-8".into()))?;
         let mut worker = CodexAppServer::spawn(&self.command)?;
-        let initialized = worker
-            .initialize(
+        let initialized = match await_cancellable(
+            &mut control.cancellation,
+            worker.initialize(
                 &CodexInitializeParams::hermes(env!("CARGO_PKG_VERSION"))
                     .with_experimental_api(true),
-            )
-            .await?;
-        worker.initialized().await?;
-        let effective = worker.read_config(&CodexConfigReadParams::for_cwd(cwd)).await?;
+            ),
+        )
+        .await
+        {
+            Cancellable::Ready(result) => result?,
+            Cancellable::Cancelled => return interrupted_before_turn(worker).await,
+        };
+        match await_cancellable(&mut control.cancellation, worker.initialized()).await {
+            Cancellable::Ready(result) => result?,
+            Cancellable::Cancelled => return interrupted_before_turn(worker).await,
+        }
+        let effective = match await_cancellable(
+            &mut control.cancellation,
+            worker.read_config(&CodexConfigReadParams::for_cwd(cwd)),
+        )
+        .await
+        {
+            Cancellable::Ready(result) => result?,
+            Cancellable::Cancelled => return interrupted_before_turn(worker).await,
+        };
         let mut policy = CodexAuthorityPolicy::new(&effective, dynamic_tools)?;
         if let Some(effort) = &self.effort {
             policy = policy.with_config_override("model_reasoning_effort", json!(effort));
         }
-        if let Some(binding) = previous_binding
+        if let Some(binding) = control.previous_binding
             && binding.authority.dynamic_tools() != policy.manifest().dynamic_tools()
         {
             return Err(CodexEngineError::Invalid(
                 "committed worker binding has a different dynamic-tool catalog".into(),
             ));
         }
-        let (opened, worker_input) = match previous_binding {
+        let (opened, worker_input) = match control.previous_binding {
             Some(binding) => {
                 let params =
                     CodexThreadForkParams::through_turn(&binding.thread_id, &binding.last_turn_id)
@@ -171,11 +233,19 @@ impl CodexTurnEngine {
                         .with_sandbox(CodexSandboxMode::ReadOnly)
                         .with_config(policy.config_overrides())
                         .with_developer_instructions(&self.developer_instructions);
-                (worker.fork_thread(&params).await?, request.prompt.clone())
+                let opened =
+                    match await_cancellable(&mut control.cancellation, worker.fork_thread(&params))
+                        .await
+                    {
+                        Cancellable::Ready(result) => result?,
+                        Cancellable::Cancelled => return interrupted_before_turn(worker).await,
+                    };
+                (opened, request.prompt.clone())
             }
             None => {
-                let opened = worker
-                    .start_thread(
+                let opened = match await_cancellable(
+                    &mut control.cancellation,
+                    worker.start_thread(
                         &policy.constrain(
                             CodexThreadStartParams::new()
                                 .with_model(&self.model)
@@ -183,10 +253,15 @@ impl CodexTurnEngine {
                                 .with_approval_policy(CodexApprovalPolicy::Never)
                                 .with_sandbox(CodexSandboxMode::ReadOnly)
                                 .with_developer_instructions(&self.developer_instructions)
-                                .with_ephemeral(!persist_worker_thread),
+                                .with_ephemeral(!control.persist_worker_thread),
                         ),
-                    )
-                    .await?;
+                    ),
+                )
+                .await
+                {
+                    Cancellable::Ready(result) => result?,
+                    Cancellable::Cancelled => return interrupted_before_turn(worker).await,
+                };
                 let worker_input =
                     project_worker_input(&request.semantic_history, &request.prompt)?;
                 (opened, worker_input)
@@ -197,7 +272,7 @@ impl CodexTurnEngine {
                 "worker did not preserve the frozen model and cwd".into(),
             ));
         }
-        if let Some(binding) = previous_binding
+        if let Some(binding) = control.previous_binding
             && opened.model_provider() != binding.model_provider
         {
             return Err(CodexEngineError::Invalid(
@@ -216,7 +291,13 @@ impl CodexTurnEngine {
         if let Some(id) = &request.client_user_message_id {
             turn_params = turn_params.with_client_user_message_id(id);
         }
-        let started = worker.start_turn(&turn_params).await?;
+        let started =
+            match await_cancellable(&mut control.cancellation, worker.start_turn(&turn_params))
+                .await
+            {
+                Cancellable::Ready(result) => result?,
+                Cancellable::Cancelled => return interrupted_before_turn(worker).await,
+            };
         let turn_id = started.turn().id().to_owned();
         let binding = CodexWorkerBinding {
             thread_id,
@@ -253,7 +334,14 @@ impl CodexTurnEngine {
         let mut message_started = false;
 
         loop {
-            match worker.next_event().await? {
+            let event =
+                match await_cancellable(&mut control.cancellation, worker.next_event()).await {
+                    Cancellable::Ready(result) => result?,
+                    Cancellable::Cancelled => {
+                        return interrupt_active_worker(worker, &binding.thread_id, &turn_id).await;
+                    }
+                };
+            match event {
                 CodexAppServerEvent::Notification(notification) => match notification {
                     CodexNotification::ThreadStarted(thread) => {
                         if thread.id() != binding.thread_id {
@@ -372,7 +460,18 @@ impl CodexTurnEngine {
                             )?;
                         }
                     }
-                    let resolved = host.resolve_approvals(&planned).await?;
+                    let resolved = match await_cancellable(
+                        &mut control.cancellation,
+                        host.resolve_approvals(&planned),
+                    )
+                    .await
+                    {
+                        Cancellable::Ready(result) => result?,
+                        Cancellable::Cancelled => {
+                            return interrupt_active_worker(worker, &binding.thread_id, &turn_id)
+                                .await;
+                        }
+                    };
                     for plan in &resolved {
                         persistence_intents.push(json!({
                             "type": "tool_planned",
@@ -407,7 +506,20 @@ impl CodexTurnEngine {
                             )?;
                         }
                     }
-                    let completed = host.execute(&resolved).await?;
+                    let completed =
+                        match await_cancellable(&mut control.cancellation, host.execute(&resolved))
+                            .await
+                        {
+                            Cancellable::Ready(result) => result?,
+                            Cancellable::Cancelled => {
+                                return interrupt_active_worker(
+                                    worker,
+                                    &binding.thread_id,
+                                    &turn_id,
+                                )
+                                .await;
+                            }
+                        };
                     let terminal = completed.first().ok_or_else(|| {
                         CodexEngineError::Invalid("dynamic tool produced no terminal".into())
                     })?;
@@ -448,15 +560,24 @@ impl CodexTurnEngine {
                             execution_key: Some(terminal.invocation_id.as_str().to_owned()),
                         }],
                     });
-                    worker
-                        .respond_dynamic_tool_call(
+                    match await_cancellable(
+                        &mut control.cancellation,
+                        worker.respond_dynamic_tool_call(
                             &server_request,
                             &CodexDynamicToolCallResponse::text(
                                 &terminal.content,
                                 terminal.status == ToolResultStatus::Succeeded,
                             ),
-                        )
-                        .await?;
+                        ),
+                    )
+                    .await
+                    {
+                        Cancellable::Ready(result) => result?,
+                        Cancellable::Cancelled => {
+                            return interrupt_active_worker(worker, &binding.thread_id, &turn_id)
+                                .await;
+                        }
+                    }
                 }
             }
         }
@@ -491,7 +612,7 @@ impl CodexTurnEngine {
             }),
         )?;
         worker.shutdown().await?;
-        Ok(CodexEngineOutcome {
+        Ok(Some(CodexEngineOutcome {
             contract: ContractOutcome {
                 provider_requests: Vec::new(),
                 semantic_conversation: transcript,
@@ -507,7 +628,111 @@ impl CodexTurnEngine {
                 },
             },
             binding,
+        }))
+    }
+}
+
+struct CodexRunControl<'a> {
+    previous_binding: Option<&'a CodexWorkerBinding>,
+    persist_worker_thread: bool,
+    cancellation: Option<&'a mut oneshot::Receiver<()>>,
+}
+
+impl<'a> CodexRunControl<'a> {
+    const fn new(
+        previous_binding: Option<&'a CodexWorkerBinding>,
+        persist_worker_thread: bool,
+        cancellation: Option<&'a mut oneshot::Receiver<()>>,
+    ) -> Self {
+        Self { previous_binding, persist_worker_thread, cancellation }
+    }
+}
+
+enum Cancellable<T> {
+    Ready(T),
+    Cancelled,
+}
+
+async fn await_cancellable<T, F>(
+    cancellation: &mut Option<&mut oneshot::Receiver<()>>,
+    future: F,
+) -> Cancellable<T>
+where
+    F: Future<Output = T>,
+{
+    match cancellation.as_deref_mut() {
+        Some(receiver) => {
+            tokio::select! {
+                biased;
+                _ = receiver => Cancellable::Cancelled,
+                value = future => Cancellable::Ready(value),
+            }
+        }
+        None => Cancellable::Ready(future.await),
+    }
+}
+
+async fn interrupted_before_turn(
+    worker: CodexAppServer,
+) -> Result<Option<CodexEngineOutcome>, CodexEngineError> {
+    let _shutdown_result = worker.shutdown().await;
+    Ok(None)
+}
+
+async fn interrupt_active_worker(
+    mut worker: CodexAppServer,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<CodexEngineOutcome>, CodexEngineError> {
+    let params = CodexTurnInterruptParams::new(thread_id, turn_id);
+    let interrupt_acknowledged =
+        matches!(timeout(INTERRUPT_ACK_TIMEOUT, worker.interrupt_turn(&params)).await, Ok(Ok(())));
+    if interrupt_acknowledged {
+        let completed = timeout(INTERRUPT_ACK_TIMEOUT, async {
+            loop {
+                match worker.next_event().await? {
+                    CodexAppServerEvent::Notification(CodexNotification::TurnCompleted(
+                        completed,
+                    )) if completed.thread_id() == thread_id
+                        && completed.turn().id() == turn_id =>
+                    {
+                        return Ok::<_, CodexAppServerError>(completed.turn().status());
+                    }
+                    CodexAppServerEvent::Request(request) => {
+                        worker
+                            .respond_error(
+                                request.id(),
+                                -32800,
+                                "Hermes interrupted the active turn",
+                                &Value::Null,
+                            )
+                            .await?;
+                    }
+                    CodexAppServerEvent::Notification(_) => {}
+                }
+            }
         })
+        .await;
+        if let Ok(Ok(status)) = completed
+            && status != CodexTurnStatus::Interrupted
+        {
+            return Err(CodexEngineError::Invalid(format!(
+                "worker acknowledged interruption but ended with status {status:?}"
+            )));
+        }
+    }
+    let _shutdown_result = worker.shutdown().await;
+    Ok(None)
+}
+
+fn expect_completed(
+    execution: Option<CodexEngineOutcome>,
+) -> Result<CodexEngineOutcome, CodexEngineError> {
+    match execution {
+        Some(outcome) => Ok(outcome),
+        None => {
+            Err(CodexEngineError::Invalid("uncancellable Codex turn reported interruption".into()))
+        }
     }
 }
 

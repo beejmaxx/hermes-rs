@@ -81,17 +81,42 @@ async fn codex_gateway_uses_terminal_approval_persists_and_projects_history()
     gateway.request(
         "second",
         "prompt.submit",
-        json!({"session_id": session_id, "text": "what happened?"}),
+        json!({"session_id": session_id, "text": "wait until I interrupt"}),
     )?;
     assert_eq!(gateway.read_response("second")?["result"]["status"], "streaming");
+    let partial = read_until_event(&mut gateway, &session_id, "message.delta")?;
+    assert_eq!(partial["params"]["payload"]["text"], "partial should not commit");
+    gateway.request("interrupt", "session.interrupt", json!({"session_id": session_id}))?;
+    let interrupted = read_response_and_session_info(&mut gateway, "interrupt", &session_id)?;
+    assert_eq!(interrupted["result"]["status"], "interrupted");
+    gateway.request("resume-two", "session.resume", json!({"session_id": session_id}))?;
+    let resumed = gateway.read_response("resume-two")?;
+    assert_eq!(resumed["result"]["message_count"], 4);
+    assert_eq!(resumed["result"]["running"], false);
+    let interrupted_session_id = domain::SessionId::new(session_id.clone())?;
+    let interrupted_snapshot =
+        SqliteSessionStore::open(&database)?.load(&interrupted_session_id)?;
+    assert_eq!(interrupted_snapshot.owner_generation.get(), 2);
+    let interrupted_binding = SqliteCodexBindingStore::open(&database)?
+        .load_current(&interrupted_session_id, interrupted_snapshot.owner_generation)?
+        .ok_or("interruption removed the last committed binding")?;
+    assert_eq!(interrupted_binding.thread_id, "thread-1");
+    assert_eq!(interrupted_binding.last_turn_id, "turn-1");
+
+    gateway.request(
+        "third",
+        "prompt.submit",
+        json!({"session_id": session_id, "text": "what happened?"}),
+    )?;
+    assert_eq!(gateway.read_response("third")?["result"]["status"], "streaming");
     let completion = read_until_message_complete(&mut gateway, &session_id)?;
     assert_eq!(
         completion["params"]["payload"]["text"],
         "The prior approved terminal action created the marker."
     );
     read_until_session_info(&mut gateway, &session_id)?;
-    gateway.request("resume-two", "session.resume", json!({"session_id": session_id}))?;
-    let resumed = gateway.read_response("resume-two")?;
+    gateway.request("resume-three", "session.resume", json!({"session_id": session_id}))?;
+    let resumed = gateway.read_response("resume-three")?;
     assert_eq!(resumed["result"]["message_count"], 6);
     assert_eq!(resumed["result"]["messages"][4]["text"], "what happened?");
     gateway.shutdown()?;
@@ -130,10 +155,10 @@ async fn codex_gateway_uses_terminal_approval_persists_and_projects_history()
     let binding = SqliteCodexBindingStore::open(&database)?
         .load_current(&session_id, snapshot.owner_generation)?
         .ok_or("committed Codex binding was not persisted")?;
-    assert_eq!(binding.thread_id, "thread-2");
-    assert_eq!(binding.last_turn_id, "turn-2");
+    assert_eq!(binding.thread_id, "thread-3");
+    assert_eq!(binding.last_turn_id, "turn-3");
     assert!(SqliteEffectLedger::open(&database)?.pending()?.is_empty());
-    assert_eq!(fs::read_to_string(counter)?, "2\n");
+    assert_eq!(fs::read_to_string(counter)?, "3\n");
     Ok(())
 }
 
@@ -188,6 +213,22 @@ fn read_until_message_complete(
         if frame["method"] == "event"
             && frame["params"]["session_id"] == session_id
             && frame["params"]["type"] == "message.complete"
+        {
+            return Ok(frame);
+        }
+    }
+}
+
+fn read_until_event(
+    gateway: &mut GatewayProcess,
+    session_id: &str,
+    event_type: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    loop {
+        let frame = gateway.read_frame()?;
+        if frame["method"] == "event"
+            && frame["params"]["session_id"] == session_id
+            && frame["params"]["type"] == event_type
         {
             return Ok(frame);
         }
@@ -372,6 +413,8 @@ require_text '"sandboxPolicy":{{"type":"readOnly","networkAccess":false}}'
 require_text '"effort":"low"'
 if [ "$count" -eq 1 ]; then
   require_text 'create the approved marker'
+elif [ "$count" -eq 2 ]; then
+  require_text 'wait until I interrupt'
 else
   require_text 'what happened?'
   reject_text 'Hermes is starting a fresh cognitive worker'
@@ -387,6 +430,19 @@ if [ "$count" -eq 1 ]; then
   require_text 'Command exited with status 0'
   require_text '"success":true'
   answer='The approved marker was created.'
+elif [ "$count" -eq 2 ]; then
+  emit "{{\"method\":\"item/agentMessage/delta\",\"params\":{{\"threadId\":\"$thread_id\",\"turnId\":\"$turn_id\",\"itemId\":\"message-$count\",\"delta\":\"partial should not commit\"}}}}"
+  read_frame
+  require_text '"method":"turn/interrupt"'
+  require_text '"threadId":"thread-2"'
+  require_text '"turnId":"turn-2"'
+  emit '{{"id":5,"result":{{}}}}'
+  emit '{{"method":"turn/completed","params":{{"threadId":"thread-2","turn":{{"id":"turn-2","status":"interrupted","items":[]}}}}}}'
+  if IFS= read -r line; then
+    echo "unexpected frame after interrupted turn: $line" >&2
+    exit 95
+  fi
+  exit 0
 else
   answer='The prior approved terminal action created the marker.'
 fi
