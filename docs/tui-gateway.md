@@ -123,18 +123,18 @@ for diagnostics. A normal user should launch it through a compatible client.
 
 The companion fork at
 [`beejmaxx/hermes-agent`](https://github.com/beejmaxx/hermes-agent) adds an
-explicit stdio process seam to the existing Ink client. Build `hermesd`, then
-run the TUI from the sibling checkout:
+explicit stdio process seam to the existing Ink client and exposes it through
+the normal Hermes launcher. Build `hermesd`, then run the TUI from the sibling
+checkout:
 
 ```bash
 cd /absolute/path/to/hermes-rs
 cargo build -p hermesd
 
 cd /absolute/path/to/hermes-agent
-npm install --workspace ui-tui
 export OPENROUTER_API_KEY="..."
-npm start --workspace ui-tui -- \
-  --gateway-command /absolute/path/to/hermes-rs/target/debug/hermesd \
+hermes --tui --gateway-command \
+  /absolute/path/to/hermes-rs/target/debug/hermesd \
   gateway \
   --provider openrouter \
   --model your-model-id \
@@ -145,19 +145,17 @@ Everything after the executable path is forwarded as an exact argument token
 to `hermesd`; no shell parses the command. Add the global `--state PATH` before
 the `gateway` subcommand when an isolated database is useful. Omitting
 `--gateway-command` preserves the client's existing Python gateway behavior.
+Hermes options such as `--resume SESSION_ID` must appear before
+`--gateway-command`, because the marker owns every token that follows it.
 
-This developer path already has a cross-repository smoke proof covering the
-real TypeScript client, the real Rust child process, a provider stream, a
-terminal event, SQLite persistence, and session resume. A polished
-`hermes --tui` configuration/launcher flow remains separate product work.
+The opt-in cross-repository test covers the real TypeScript client, the real
+Rust child process, a provider stream, terminal approval and execution, SQLite
+persistence and resume, and durable delegation delivery.
 
 ## Deliberate limitations
 
 This is a usable vertical slice, not a claim of full gateway parity:
 
-- Upstream Hermes still hard-codes `python -m tui_gateway.entry`; the companion
-  fork has the explicit process seam, but the normal `hermes --tui` launcher
-  does not expose it yet.
 - Session creation currently persists an empty frozen lineage immediately;
   Python delays that row until the first prompt.
 - Steer/queue, image attachment, slash execution, configuration mutation, and

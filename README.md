@@ -119,11 +119,11 @@ This command emits protocol frames for a client rather than drawing a UI. It
 supports foreground streaming and recovery plus durable background delegation.
 Accepted prompts and delivered background events are captured atomically
 before provider work. A gateway restart exposes abandoned foreground or child
-work as `outcome_unknown` without replaying billable inference. The stock
-Hermes launcher does not select the Rust child yet, while the companion
-`beejmaxx/hermes-agent` fork can run it explicitly. See
-[docs/tui-gateway.md](docs/tui-gateway.md) for the exact supported method set
-launch command and current limitations.
+work as `outcome_unknown` without replaying billable inference. The companion
+`beejmaxx/hermes-agent` fork exposes the child-process seam through the normal
+`hermes --tui --gateway-command ...` launcher. See
+[docs/tui-gateway.md](docs/tui-gateway.md) for the exact supported method set,
+launch command, and current limitations.
 
 New gateway sessions additionally expose a real shell-backed `terminal` tool.
 Every call blocks on the Ink approval overlay; the plan is journaled before the
