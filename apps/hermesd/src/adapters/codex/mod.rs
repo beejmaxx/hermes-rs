@@ -1,6 +1,7 @@
 //! Supervised Codex app-server process and its typed stdio protocol subset.
 
 mod authority;
+mod engine;
 mod protocol;
 
 use std::{
@@ -13,6 +14,10 @@ use std::{
 };
 
 pub use authority::{CodexAuthorityError, CodexAuthorityManifest, CodexAuthorityPolicy};
+pub use engine::{
+    CodexEngineError, CodexEngineOutcome, CodexEngineTurnRequest, CodexTurnEngine,
+    CodexWorkerBinding, dynamic_tools_from_catalog,
+};
 pub use protocol::{
     CodexAgentMessageDelta, CodexAppServerEvent, CodexApprovalPolicy, CodexConfigReadParams,
     CodexConfigReadResponse, CodexDynamicToolCallOutputContentItem, CodexDynamicToolCallParams,

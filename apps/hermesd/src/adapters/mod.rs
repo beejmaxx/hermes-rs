@@ -18,11 +18,12 @@ pub use codex::{
     CodexAuthorityPolicy, CodexConfigReadParams, CodexConfigReadResponse,
     CodexDynamicToolCallOutputContentItem, CodexDynamicToolCallParams,
     CodexDynamicToolCallResponse, CodexDynamicToolFunctionSpec, CodexDynamicToolSpec,
-    CodexInitializeParams, CodexInitializeResponse, CodexNotification, CodexRequestId,
-    CodexSandboxMode, CodexServerRequest, CodexThread, CodexThreadOpenResponse,
-    CodexThreadResumeParams, CodexThreadStartParams, CodexTurn, CodexTurnCompleted,
+    CodexEngineError, CodexEngineOutcome, CodexEngineTurnRequest, CodexInitializeParams,
+    CodexInitializeResponse, CodexNotification, CodexRequestId, CodexSandboxMode,
+    CodexServerRequest, CodexThread, CodexThreadOpenResponse, CodexThreadResumeParams,
+    CodexThreadStartParams, CodexTurn, CodexTurnCompleted, CodexTurnEngine,
     CodexTurnInterruptParams, CodexTurnStartParams, CodexTurnStartResponse, CodexTurnStarted,
-    CodexTurnStatus,
+    CodexTurnStatus, CodexWorkerBinding, dynamic_tools_from_catalog,
 };
 pub use local_tools::{LocalToolsConfigError, ReadOnlyLocalTools};
 pub use openai::{OpenAiCompatibleProvider, OpenAiProviderConfigError};

@@ -99,6 +99,21 @@ effect semantics. The journal decorator also validates kernel identities
 before writing a plan, so a malformed adapter cannot poison the durable ledger
 before the host rejects it.
 
+The first external cognitive engine is Codex app-server. Hermes launches the
+authenticated process with exact arguments over stdio, freezes a dynamic-tool
+catalog for the worker thread, and explicitly removes Codex-owned execution
+environments, shell, web search, plugins, apps, hooks, multi-agent features,
+and every user-configured MCP server discovered from effective config. Codex
+may propose a dynamic tool call; only `ToolHost` can issue its invocation
+identity, journal and execute it, and return the terminal evidence. Hermes
+retains the canonical semantic transcript. The Codex thread identity and
+capability manifest are opaque binding evidence, not conversation authority.
+
+The current proof intentionally opens one ephemeral worker thread for one
+turn. Durable worker bindings, thread resume, interrupt propagation, and
+gateway engine selection remain host-integration work; the adapter does not
+pretend those lifecycle semantics are complete.
+
 The durable proof currently covers:
 
 1. create an immutable session lineage and prompt manifest;
