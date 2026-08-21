@@ -123,9 +123,8 @@ for diagnostics. A normal user should launch it through a compatible client.
 
 The companion fork at
 [`beejmaxx/hermes-agent`](https://github.com/beejmaxx/hermes-agent) adds an
-explicit stdio process seam to the existing Ink client and exposes it through
-the normal Hermes launcher. Build `hermesd`, then run the TUI from the sibling
-checkout:
+explicit stdio process seam to the existing Ink client. Build `hermesd`, then
+run the TUI directly from a sibling checkout:
 
 ```bash
 cd /absolute/path/to/hermes-rs
@@ -133,7 +132,8 @@ cargo build -p hermesd
 
 cd /absolute/path/to/hermes-agent
 export OPENROUTER_API_KEY="..."
-hermes --tui --gateway-command \
+npm start --workspace ui-tui -- \
+  --gateway-command \
   /absolute/path/to/hermes-rs/target/debug/hermesd \
   gateway \
   --provider openrouter \
@@ -145,8 +145,10 @@ Everything after the executable path is forwarded as an exact argument token
 to `hermesd`; no shell parses the command. Add the global `--state PATH` before
 the `gateway` subcommand when an isolated database is useful. Omitting
 `--gateway-command` preserves the client's existing Python gateway behavior.
-Hermes options such as `--resume SESSION_ID` must appear before
-`--gateway-command`, because the marker owns every token that follows it.
+This direct client command keeps the Rust project independent of Hermes's
+Python launcher. A local launcher patch may provide the same selection through
+`hermes --tui`, but publishing that product integration is deliberately
+deferred until real usage proves it is worth maintaining.
 
 The opt-in cross-repository test covers the real TypeScript client, the real
 Rust child process, a provider stream, terminal approval and execution, SQLite

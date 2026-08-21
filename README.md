@@ -120,8 +120,9 @@ supports foreground streaming and recovery plus durable background delegation.
 Accepted prompts and delivered background events are captured atomically
 before provider work. A gateway restart exposes abandoned foreground or child
 work as `outcome_unknown` without replaying billable inference. The companion
-`beejmaxx/hermes-agent` fork exposes the child-process seam through the normal
-`hermes --tui --gateway-command ...` launcher. See
+`beejmaxx/hermes-agent` fork exposes the child-process seam through the Ink
+client's explicit `--gateway-command`; the normal Hermes launcher integration
+remains optional local work. See
 [docs/tui-gateway.md](docs/tui-gateway.md) for the exact supported method set,
 launch command, and current limitations.
 
