@@ -103,8 +103,9 @@ history. Gateway startup reconciles a leftover `running` claim to
 The stdio gateway connects the background-delegation substrate end to end:
 atomic child/spec acceptance, generation-guarded claims, heartbeating leases,
 worker fencing, atomic child-turn/terminal/outbox completion, conservative
-restart reconciliation, and claimed delivery with the next explicit parent
-turn. See [durable-delegation.md](durable-delegation.md).
+restart reconciliation, durable list/status/cancel control, and claimed
+delivery with the next explicit parent turn. See
+[durable-delegation.md](durable-delegation.md).
 
 ## Leaf delegation
 
@@ -124,8 +125,9 @@ The one-shot `chat` host deliberately keeps this behavior synchronous. New
 gateway sessions freeze a different description of the same tool name: it
 returns a durable handle immediately, and the gateway supervisor delivers the
 child terminal at the next explicit user turn. Both variants remain leaf-only;
-steering, cancellation, and nested orchestration are later transitions rather
-than assumptions copied from the old Kanban workflow.
+running cancellation is a durable fenced transition, while steering and nested
+orchestration remain later work rather than assumptions copied from the old
+Kanban workflow.
 
 ## Long-lived client edge
 

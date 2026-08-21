@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 /// SQLite-backed single-writer durable session repository.
 pub struct SqliteSessionStore {
@@ -147,7 +147,7 @@ impl SqliteSessionStore {
                     )
                     .map_err(storage_error)?;
             }
-            2 | 3 | 4 | SCHEMA_VERSION => {}
+            2 | 3 | 4 | 5 | SCHEMA_VERSION => {}
             other => {
                 return Err(SessionStoreError::Storage(format!(
                     "unsupported SQLite schema version {other}; expected {SCHEMA_VERSION}"
@@ -267,6 +267,17 @@ impl SqliteSessionStore {
                          ADD COLUMN provider_prompt TEXT NOT NULL DEFAULT '';
                      UPDATE foreground_turns SET provider_prompt = prompt;
                      PRAGMA user_version = 5;
+                     COMMIT;",
+                )
+                .map_err(storage_error)?;
+        }
+        if version <= 5 {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE delegations ADD COLUMN cancellation_reason TEXT;
+                     ALTER TABLE delegations ADD COLUMN cancellation_requested_at_ms INTEGER;
+                     PRAGMA user_version = 6;
                      COMMIT;",
                 )
                 .map_err(storage_error)?;

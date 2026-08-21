@@ -45,6 +45,7 @@ submit a prompt, and reopen its durable transcript:
 | Sessions | `session.create`, `session.resume`, `session.activate`, `session.close`, `session.interrupt`, `session.list`, `session.active_list`, `session.most_recent`, `session.usage` |
 | Input | `input.detect_drop`, `complete.slash`, `complete.path`, `terminal.resize`, `system.battery` |
 | Turns | `prompt.submit` |
+| Background tasks | `delegation.list`, `delegation.status`, `delegation.cancel` |
 
 `prompt.submit` acknowledges with `{"status":"streaming"}` and emits
 `message.start`, zero or more `message.delta`, tool/reasoning events,
@@ -80,6 +81,15 @@ On forced process death, the replacement gateway uses its exclusive process
 lease to reconcile abandoned children to `outcome_unknown`; it never
 automatically repeats their provider calls. The process-level tests cover both
 normal completion delivery and this kill/restart path.
+
+Background tasks can be inspected and cancelled through their parent session.
+Cancellation is persisted before the live worker is signalled. Pending work
+never reaches the provider; running work can commit only its matching cancelled
+terminal after the request. A durable poll closes the race where cancellation
+arrives between claim and live-signal registration. Cancelled completions use
+the same exactly-once next-turn delivery as successful and failed outcomes. A
+restart after the intent commit finishes that known cancellation; it does not
+misreport the abandoned worker as outcome-unknown.
 
 The child-process integration test drives this entire path through real stdio,
 a local mocked OpenAI-compatible streaming endpoint, the actual runtime, and a
@@ -145,8 +155,8 @@ This is a usable vertical slice, not a claim of full gateway parity:
   Python delays that row until the first prompt.
 - Steer/queue, approvals, image attachment, shell/slash execution,
   configuration mutation, and desktop/WebSocket methods are not implemented.
-- Background-child cancellation, steering, nested delegation, and replay of an
-  ambiguous child outcome are not implemented.
+- Background-child steering, nested delegation, and replay of an ambiguous
+  child outcome are not implemented.
 
 Unsupported methods return JSON-RPC `-32601`; the gateway does not silently
 pretend that a capability exists. These gaps define follow-up behavior slices

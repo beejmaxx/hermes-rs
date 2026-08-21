@@ -3,9 +3,9 @@
 use std::path::Path;
 
 use domain::{
-    CompletionEventId, DelegationAuthority, DelegationId, DelegationSpec, DelegationState,
-    DelegationTerminal, DelegationWorkerId, DeliveryClaimId, FencingToken, OwnerGeneration,
-    SessionId,
+    CompletionEventId, DelegationAuthority, DelegationCancellation, DelegationId, DelegationSpec,
+    DelegationState, DelegationTerminal, DelegationWorkerId, DeliveryClaimId, FencingToken,
+    OwnerGeneration, SessionId,
 };
 use ports::{DelegationStore, DelegationStoreError, SessionStoreError};
 use protocol::{DelegationCompletion, DelegationSnapshot, SessionConfig};
@@ -74,6 +74,41 @@ impl DelegationStore for SqliteDelegationStore {
         snapshot_from_raw(load_raw(&self.connection, delegation_id)?)
     }
 
+    fn list_for_parent(
+        &mut self,
+        parent_session_id: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<DelegationSnapshot>, DelegationStoreError> {
+        if limit == 0 {
+            return Err(DelegationStoreError::Invalid(
+                "delegation list limit must be greater than zero".into(),
+            ));
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT delegation_id FROM delegations
+                 WHERE parent_session_id = ?1
+                 ORDER BY created_at_ms DESC, delegation_id DESC LIMIT ?2",
+            )
+            .map_err(storage_error)?;
+        let rows = statement
+            .query_map(
+                params![parent_session_id.as_str(), usize_to_i64(limit, "delegation list limit")?,],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(storage_error)?;
+        let ids = rows.map(|row| row.map_err(storage_error)).collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        ids.into_iter()
+            .map(|id| {
+                let id = DelegationId::new(id)
+                    .map_err(|error| DelegationStoreError::Invalid(error.to_string()))?;
+                snapshot_from_raw(load_raw(&self.connection, &id)?)
+            })
+            .collect()
+    }
+
     fn pending(&mut self, limit: usize) -> Result<Vec<DelegationSnapshot>, DelegationStoreError> {
         if limit == 0 {
             return Err(DelegationStoreError::Invalid(
@@ -120,6 +155,7 @@ impl DelegationStore for SqliteDelegationStore {
         let raw = load_raw(&transaction, delegation_id)?;
         ensure_generation(&raw, expected_generation)?;
         ensure_monotonic_timestamp(&raw, now_ms, "claim timestamp")?;
+        ensure_no_cancellation(&raw)?;
         if raw.state != "pending" {
             return Err(DelegationStoreError::NotClaimable {
                 delegation_id: delegation_id.clone(),
@@ -210,6 +246,105 @@ impl DelegationStore for SqliteDelegationStore {
         snapshot_from_raw(load_raw(&self.connection, delegation_id)?)
     }
 
+    fn cancel(
+        &mut self,
+        delegation_id: &DelegationId,
+        expected_generation: OwnerGeneration,
+        reason: &str,
+        requested_at_ms: u64,
+    ) -> Result<DelegationSnapshot, DelegationStoreError> {
+        validate_detail(reason, "delegation cancellation reason")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        let raw = load_raw(&transaction, delegation_id)?;
+        ensure_generation(&raw, expected_generation)?;
+        ensure_monotonic_timestamp(&raw, requested_at_ms, "cancellation timestamp")?;
+        match raw.state.as_str() {
+            "pending" => {
+                let outcome = DelegationTerminal::Cancelled { reason: reason.into() };
+                let completion = completion_from_raw(&raw, outcome.clone(), requested_at_ms)?;
+                let next_generation = increment(raw.owner_generation, "owner generation")?;
+                let updated = transaction
+                    .execute(
+                        "UPDATE delegations
+                         SET state = 'cancelled', owner_generation = ?1, fencing_token = 1,
+                             terminal_json = ?2, updated_at_ms = ?3
+                         WHERE delegation_id = ?4 AND state = 'pending'
+                           AND owner_generation = ?5",
+                        params![
+                            next_generation,
+                            serde_json::to_string(&outcome).map_err(storage_error)?,
+                            to_i64(requested_at_ms, "cancellation timestamp")?,
+                            delegation_id.as_str(),
+                            to_i64(expected_generation.get(), "expected generation")?,
+                        ],
+                    )
+                    .map_err(storage_error)?;
+                if updated != 1 {
+                    return Err(DelegationStoreError::GenerationConflict {
+                        delegation_id: delegation_id.clone(),
+                        expected: expected_generation.get(),
+                        actual: u64_from_i64(raw.owner_generation, "owner generation")?,
+                    });
+                }
+                insert_completion(&transaction, &completion)?;
+            }
+            "running" => {
+                ensure_active_lease(&raw, requested_at_ms)?;
+                match (&raw.cancellation_reason, raw.cancellation_requested_at_ms) {
+                    (Some(existing), Some(_)) if existing == reason => {}
+                    (Some(_), Some(_)) => {
+                        return Err(DelegationStoreError::NotClaimable {
+                            delegation_id: delegation_id.clone(),
+                            state: "cancellation_requested".into(),
+                        });
+                    }
+                    (None, None) => {
+                        let updated = transaction
+                            .execute(
+                                "UPDATE delegations
+                                 SET cancellation_reason = ?1,
+                                     cancellation_requested_at_ms = ?2, updated_at_ms = ?2
+                                 WHERE delegation_id = ?3 AND state = 'running'
+                                   AND owner_generation = ?4
+                                   AND cancellation_reason IS NULL
+                                   AND cancellation_requested_at_ms IS NULL",
+                                params![
+                                    reason,
+                                    to_i64(requested_at_ms, "cancellation timestamp")?,
+                                    delegation_id.as_str(),
+                                    to_i64(expected_generation.get(), "expected generation")?,
+                                ],
+                            )
+                            .map_err(storage_error)?;
+                        if updated != 1 {
+                            return Err(DelegationStoreError::GenerationConflict {
+                                delegation_id: delegation_id.clone(),
+                                expected: expected_generation.get(),
+                                actual: u64_from_i64(raw.owner_generation, "owner generation")?,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(DelegationStoreError::Invalid(
+                            "stored cancellation reason and timestamp must be paired".into(),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(DelegationStoreError::NotClaimable {
+                    delegation_id: delegation_id.clone(),
+                    state: raw.state,
+                });
+            }
+        }
+        transaction.commit().map_err(storage_error)?;
+        snapshot_from_raw(load_raw(&self.connection, delegation_id)?)
+    }
+
     fn finish(
         &mut self,
         delegation_id: &DelegationId,
@@ -228,13 +363,15 @@ impl DelegationStore for SqliteDelegationStore {
         ensure_running_fence(&raw, fencing_token)?;
         ensure_monotonic_timestamp(&raw, completed_at_ms, "completion timestamp")?;
         ensure_active_lease(&raw, completed_at_ms)?;
+        ensure_legal_terminal(&raw, &outcome)?;
         let completion = completion_from_raw(&raw, outcome.clone(), completed_at_ms)?;
         let next_generation = increment(raw.owner_generation, "owner generation")?;
         let updated = transaction
             .execute(
                 "UPDATE delegations
                  SET state = ?1, owner_generation = ?2, lease_expires_at_ms = NULL,
-                     terminal_json = ?3, updated_at_ms = ?4
+                     terminal_json = ?3, cancellation_reason = NULL,
+                     cancellation_requested_at_ms = NULL, updated_at_ms = ?4
                  WHERE delegation_id = ?5 AND state = 'running'
                    AND owner_generation = ?6 AND fencing_token = ?7",
                 params![
@@ -280,6 +417,7 @@ impl DelegationStore for SqliteDelegationStore {
         ensure_running_fence(&raw, authority.fencing_token)?;
         ensure_monotonic_timestamp(&raw, completed_at_ms, "completion timestamp")?;
         ensure_active_lease(&raw, completed_at_ms)?;
+        ensure_legal_terminal(&raw, &outcome)?;
         let child_session_id = SessionId::new(raw.child_session_id.clone())
             .map_err(|error| DelegationStoreError::Invalid(error.to_string()))?;
         append_turn_in_transaction(
@@ -295,7 +433,8 @@ impl DelegationStore for SqliteDelegationStore {
             .execute(
                 "UPDATE delegations
                  SET state = 'completed', owner_generation = ?1, lease_expires_at_ms = NULL,
-                     terminal_json = ?2, updated_at_ms = ?3
+                     terminal_json = ?2, cancellation_reason = NULL,
+                     cancellation_requested_at_ms = NULL, updated_at_ms = ?3
                  WHERE delegation_id = ?4 AND state = 'running'
                    AND owner_generation = ?5 AND fencing_token = ?6",
                 params![
@@ -334,6 +473,7 @@ impl DelegationStore for SqliteDelegationStore {
                 "SELECT delegation_id, completion_event_id, parent_session_id,
                         child_session_id, goal, context, state, owner_generation,
                         worker_id, fencing_token, lease_expires_at_ms, terminal_json,
+                        cancellation_reason, cancellation_requested_at_ms,
                         created_at_ms, updated_at_ms
                  FROM delegations
                  WHERE state = 'running' AND lease_expires_at_ms <= ?1
@@ -352,22 +492,26 @@ impl DelegationStore for SqliteDelegationStore {
                     "running delegation has no durable lease deadline".into(),
                 )
             })?;
-            let outcome = DelegationTerminal::OutcomeUnknown {
-                reason: format!(
+            let outcome = reconciliation_outcome(
+                &raw,
+                format!(
                     "worker lease expired at {deadline}; no terminal outcome was durably recorded"
                 ),
-            };
+            )?;
             let completion = completion_from_raw(&raw, outcome.clone(), now_ms)?;
             let next_generation = increment(raw.owner_generation, "owner generation")?;
             let updated = transaction
                 .execute(
                     "UPDATE delegations
-                     SET state = 'outcome_unknown', owner_generation = ?1,
-                         lease_expires_at_ms = NULL, terminal_json = ?2, updated_at_ms = ?3
-                     WHERE delegation_id = ?4 AND state = 'running'
-                       AND owner_generation = ?5 AND fencing_token = ?6
-                       AND lease_expires_at_ms <= ?3",
+                     SET state = ?1, owner_generation = ?2,
+                         lease_expires_at_ms = NULL, terminal_json = ?3,
+                         cancellation_reason = NULL, cancellation_requested_at_ms = NULL,
+                         updated_at_ms = ?4
+                     WHERE delegation_id = ?5 AND state = 'running'
+                       AND owner_generation = ?6 AND fencing_token = ?7
+                       AND lease_expires_at_ms <= ?4",
                     params![
+                        outcome.status_name(),
                         next_generation,
                         serde_json::to_string(&outcome).map_err(storage_error)?,
                         now,
@@ -407,6 +551,7 @@ impl DelegationStore for SqliteDelegationStore {
                 "SELECT delegation_id, completion_event_id, parent_session_id,
                         child_session_id, goal, context, state, owner_generation,
                         worker_id, fencing_token, lease_expires_at_ms, terminal_json,
+                        cancellation_reason, cancellation_requested_at_ms,
                         created_at_ms, updated_at_ms
                  FROM delegations
                  WHERE state = 'running'
@@ -420,17 +565,20 @@ impl DelegationStore for SqliteDelegationStore {
         let mut completions = Vec::with_capacity(running.len());
         for raw in running {
             ensure_monotonic_timestamp(&raw, now_ms, "reconciliation timestamp")?;
-            let outcome = DelegationTerminal::OutcomeUnknown { reason: reason.into() };
+            let outcome = reconciliation_outcome(&raw, reason.into())?;
             let completion = completion_from_raw(&raw, outcome.clone(), now_ms)?;
             let next_generation = increment(raw.owner_generation, "owner generation")?;
             let updated = transaction
                 .execute(
                     "UPDATE delegations
-                     SET state = 'outcome_unknown', owner_generation = ?1,
-                         lease_expires_at_ms = NULL, terminal_json = ?2, updated_at_ms = ?3
-                     WHERE delegation_id = ?4 AND state = 'running'
-                       AND owner_generation = ?5 AND fencing_token = ?6",
+                     SET state = ?1, owner_generation = ?2,
+                         lease_expires_at_ms = NULL, terminal_json = ?3,
+                         cancellation_reason = NULL, cancellation_requested_at_ms = NULL,
+                         updated_at_ms = ?4
+                     WHERE delegation_id = ?5 AND state = 'running'
+                       AND owner_generation = ?6 AND fencing_token = ?7",
                     params![
+                        outcome.status_name(),
                         next_generation,
                         serde_json::to_string(&outcome).map_err(storage_error)?,
                         now,
@@ -682,6 +830,7 @@ fn load_raw(
             "SELECT delegation_id, completion_event_id, parent_session_id,
                     child_session_id, goal, context, state, owner_generation,
                     worker_id, fencing_token, lease_expires_at_ms, terminal_json,
+                    cancellation_reason, cancellation_requested_at_ms,
                     created_at_ms, updated_at_ms
              FROM delegations WHERE delegation_id = ?1",
             params![delegation_id.as_str()],
@@ -706,17 +855,22 @@ fn raw_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawDelegation> {
         fencing_token: row.get(9)?,
         lease_expires_at_ms: row.get(10)?,
         terminal_json: row.get(11)?,
-        created_at_ms: row.get(12)?,
-        updated_at_ms: row.get(13)?,
+        cancellation_reason: row.get(12)?,
+        cancellation_requested_at_ms: row.get(13)?,
+        created_at_ms: row.get(14)?,
+        updated_at_ms: row.get(15)?,
     })
 }
 
 fn snapshot_from_raw(raw: RawDelegation) -> Result<DelegationSnapshot, DelegationStoreError> {
     let spec = spec_from_raw(&raw)?;
     let state = match raw.state.as_str() {
-        "pending" => DelegationState::Pending,
+        "pending" => {
+            ensure_no_cancellation(&raw)?;
+            DelegationState::Pending
+        }
         "running" => DelegationState::Running {
-            worker_id: DelegationWorkerId::new(raw.worker_id.ok_or_else(|| {
+            worker_id: DelegationWorkerId::new(raw.worker_id.clone().ok_or_else(|| {
                 DelegationStoreError::Invalid("running delegation has no worker id".into())
             })?)
             .map_err(|error| DelegationStoreError::Invalid(error.to_string()))?,
@@ -727,8 +881,10 @@ fn snapshot_from_raw(raw: RawDelegation) -> Result<DelegationSnapshot, Delegatio
                 })?,
                 "lease deadline",
             )?,
+            cancellation: cancellation_from_raw(&raw)?,
         },
         "completed" | "failed" | "cancelled" | "outcome_unknown" => {
+            ensure_no_cancellation(&raw)?;
             let encoded = raw.terminal_json.as_deref().ok_or_else(|| {
                 DelegationStoreError::Invalid("terminal delegation has no outcome".into())
             })?;
@@ -901,6 +1057,71 @@ fn ensure_active_lease(
     Ok(())
 }
 
+fn cancellation_from_raw(
+    raw: &RawDelegation,
+) -> Result<Option<DelegationCancellation>, DelegationStoreError> {
+    match (&raw.cancellation_reason, raw.cancellation_requested_at_ms) {
+        (None, None) => Ok(None),
+        (Some(reason), Some(requested_at_ms)) => {
+            validate_detail(reason, "stored delegation cancellation reason")?;
+            let requested_at_ms = u64_from_i64(requested_at_ms, "cancellation timestamp")?;
+            let created_at_ms = u64_from_i64(raw.created_at_ms, "creation timestamp")?;
+            let updated_at_ms = u64_from_i64(raw.updated_at_ms, "update timestamp")?;
+            if requested_at_ms < created_at_ms || requested_at_ms > updated_at_ms {
+                return Err(DelegationStoreError::Invalid(
+                    "stored cancellation timestamp is outside the delegation lifetime".into(),
+                ));
+            }
+            Ok(Some(DelegationCancellation { reason: reason.clone(), requested_at_ms }))
+        }
+        _ => Err(DelegationStoreError::Invalid(
+            "stored cancellation reason and timestamp must be paired".into(),
+        )),
+    }
+}
+
+fn ensure_no_cancellation(raw: &RawDelegation) -> Result<(), DelegationStoreError> {
+    if raw.cancellation_reason.is_some() || raw.cancellation_requested_at_ms.is_some() {
+        return Err(DelegationStoreError::Invalid(format!(
+            "{} delegation retained a cancellation request",
+            raw.state
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_legal_terminal(
+    raw: &RawDelegation,
+    outcome: &DelegationTerminal,
+) -> Result<(), DelegationStoreError> {
+    match (cancellation_from_raw(raw)?, outcome) {
+        (None, DelegationTerminal::Cancelled { .. }) => Err(DelegationStoreError::Invalid(
+            "worker cannot cancel a delegation without durable operator intent".into(),
+        )),
+        (None, _) => Ok(()),
+        (Some(cancellation), DelegationTerminal::Cancelled { reason })
+            if cancellation.reason == reason.as_str() =>
+        {
+            Ok(())
+        }
+        (Some(_), _) => Err(DelegationStoreError::NotClaimable {
+            delegation_id: DelegationId::new(raw.delegation_id.clone())
+                .map_err(|error| DelegationStoreError::Invalid(error.to_string()))?,
+            state: "cancellation_requested".into(),
+        }),
+    }
+}
+
+fn reconciliation_outcome(
+    raw: &RawDelegation,
+    unknown_reason: String,
+) -> Result<DelegationTerminal, DelegationStoreError> {
+    Ok(match cancellation_from_raw(raw)? {
+        Some(cancellation) => DelegationTerminal::Cancelled { reason: cancellation.reason },
+        None => DelegationTerminal::OutcomeUnknown { reason: unknown_reason },
+    })
+}
+
 fn validate_spec(spec: &DelegationSpec) -> Result<(), DelegationStoreError> {
     if spec.parent_session_id == spec.child_session_id {
         return Err(DelegationStoreError::Invalid(
@@ -1009,6 +1230,8 @@ struct RawDelegation {
     fencing_token: i64,
     lease_expires_at_ms: Option<i64>,
     terminal_json: Option<String>,
+    cancellation_reason: Option<String>,
+    cancellation_requested_at_ms: Option<i64>,
     created_at_ms: i64,
     updated_at_ms: i64,
 }
@@ -1018,9 +1241,10 @@ mod tests {
     use std::fs;
 
     use domain::{
-        CompletionEventId, DelegationAuthority, DelegationId, DelegationSpec, DelegationState,
-        DelegationTerminal, DelegationWorkerId, DeliveryClaimId, EngineId, FencingToken, LineageId,
-        ManifestDigest, PromptManifest, SemanticMessage, SessionId,
+        CompletionEventId, DelegationAuthority, DelegationCancellation, DelegationId,
+        DelegationSpec, DelegationState, DelegationTerminal, DelegationWorkerId, DeliveryClaimId,
+        EngineId, FencingToken, LineageId, ManifestDigest, PromptManifest, SemanticMessage,
+        SessionId,
     };
     use ports::{DelegationStore, DelegationStoreError, SessionStore};
     use protocol::{SessionConfig, TransportKind};
@@ -1293,6 +1517,156 @@ mod tests {
     }
 
     #[test]
+    fn pending_cancellation_is_terminal_without_dispatch() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = Fixture::new()?;
+        let mut store = SqliteDelegationStore::open(&fixture.database)?;
+        let pending = store.create(fixture.spec.clone(), 100)?;
+
+        let cancelled = store.cancel(
+            &fixture.spec.delegation_id,
+            pending.owner_generation,
+            "operator no longer needs the result",
+            110,
+        )?;
+        assert_eq!(cancelled.owner_generation.get(), 2);
+        assert!(matches!(
+            &cancelled.state,
+            DelegationState::Terminal {
+                outcome: DelegationTerminal::Cancelled { reason },
+                completed_at_ms: 110,
+            } if reason == "operator no longer needs the result"
+        ));
+        assert!(store.pending(10)?.is_empty());
+        assert_eq!(
+            store.list_for_parent(&fixture.spec.parent_session_id, 10)?,
+            vec![cancelled.clone()]
+        );
+        let completions =
+            store.available_completions_for(&fixture.spec.parent_session_id, 110, 10)?;
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].delegation_id, fixture.spec.delegation_id);
+        assert!(matches!(completions[0].outcome, DelegationTerminal::Cancelled { .. }));
+        assert!(
+            SqliteSessionStore::open(&fixture.database)?
+                .load(&fixture.spec.child_session_id)?
+                .conversation
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn running_cancellation_fences_every_non_cancelled_terminal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let mut store = SqliteDelegationStore::open(&fixture.database)?;
+        let pending = store.create(fixture.spec.clone(), 100)?;
+        let running = store.claim(
+            &fixture.spec.delegation_id,
+            pending.owner_generation,
+            DelegationWorkerId::new("worker-cancelled")?,
+            110,
+            300,
+        )?;
+        let fence = match running.state {
+            DelegationState::Running { fencing_token, .. } => fencing_token,
+            other => return Err(format!("expected running state, got {other:?}").into()),
+        };
+
+        let cancellation = store.cancel(
+            &fixture.spec.delegation_id,
+            running.owner_generation,
+            "operator requested cancellation",
+            120,
+        )?;
+        assert_eq!(cancellation.owner_generation, running.owner_generation);
+        assert!(matches!(
+            &cancellation.state,
+            DelegationState::Running {
+                cancellation: Some(DelegationCancellation { reason, requested_at_ms: 120 }),
+                ..
+            } if reason == "operator requested cancellation"
+        ));
+        assert_eq!(
+            store
+                .cancel(
+                    &fixture.spec.delegation_id,
+                    cancellation.owner_generation,
+                    "operator requested cancellation",
+                    121,
+                )?
+                .state,
+            cancellation.state
+        );
+        assert!(matches!(
+            store.finish(
+                &fixture.spec.delegation_id,
+                cancellation.owner_generation,
+                fence,
+                DelegationTerminal::Failed { error: "provider failed after cancellation".into() },
+                122,
+            ),
+            Err(DelegationStoreError::NotClaimable { .. })
+        ));
+        assert!(matches!(
+            store.finish(
+                &fixture.spec.delegation_id,
+                cancellation.owner_generation,
+                fence,
+                DelegationTerminal::Cancelled { reason: "different reason".into() },
+                123,
+            ),
+            Err(DelegationStoreError::NotClaimable { .. })
+        ));
+
+        let completion = store.finish(
+            &fixture.spec.delegation_id,
+            cancellation.owner_generation,
+            fence,
+            DelegationTerminal::Cancelled { reason: "operator requested cancellation".into() },
+            124,
+        )?;
+        assert!(matches!(completion.outcome, DelegationTerminal::Cancelled { .. }));
+        assert!(store.load(&fixture.spec.delegation_id)?.state.is_terminal());
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_cancellation_intent_reconciles_as_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new()?;
+        let mut store = SqliteDelegationStore::open(&fixture.database)?;
+        let pending = store.create(fixture.spec.clone(), 100)?;
+        let running = store.claim(
+            &fixture.spec.delegation_id,
+            pending.owner_generation,
+            DelegationWorkerId::new("worker-before-restart")?,
+            110,
+            300,
+        )?;
+        store.cancel(
+            &fixture.spec.delegation_id,
+            running.owner_generation,
+            "cancel intent survived the owner",
+            120,
+        )?;
+
+        let reconciled = store.reconcile_running("gateway owner disappeared", 130)?;
+        assert_eq!(reconciled.len(), 1);
+        assert!(matches!(
+            &reconciled[0].outcome,
+            DelegationTerminal::Cancelled { reason }
+                if reason == "cancel intent survived the owner"
+        ));
+        assert!(matches!(
+            store.load(&fixture.spec.delegation_id)?.state,
+            DelegationState::Terminal { outcome: DelegationTerminal::Cancelled { .. }, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn create_requires_distinct_existing_parent_and_child_sessions()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new()?;
@@ -1339,7 +1713,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert_eq!(table_count, 3);
 
         let mut sessions = SqliteSessionStore::open(&database)?;

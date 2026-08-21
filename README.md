@@ -103,7 +103,9 @@ queues a durable child immediately. A fenced, heartbeating worker runs that
 child in its own immutable session, and its terminal result enters the parent
 exactly once with the next explicit user turn. Both modes give children only
 the read-only tools and no recursive delegation. Existing sessions retain the
-tool behavior frozen in their original catalog.
+tool behavior frozen in their original catalog. Gateway clients can inspect or
+cancel these runs with `delegation.list`, `delegation.status`, and
+`delegation.cancel`; cancellation is durable before the worker is signalled.
 
 The same durable runtime is now also reachable through a minimal long-lived
 stdio JSON-RPC host compatible with the core Hermes TUI framing:

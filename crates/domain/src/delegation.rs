@@ -17,6 +17,16 @@ pub struct DelegationAuthority {
     pub fencing_token: FencingToken,
 }
 
+/// Durable operator intent that constrains the current worker's only legal terminal.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationCancellation {
+    /// Stable human-readable cancellation reason.
+    pub reason: String,
+    /// Wall-clock request timestamp in Unix milliseconds.
+    pub requested_at_ms: u64,
+}
+
 /// Immutable relationship and task input captured before background dispatch.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -88,6 +98,9 @@ pub enum DelegationState {
         fencing_token: FencingToken,
         /// Wall-clock lease deadline in Unix milliseconds.
         lease_expires_at_ms: u64,
+        /// Persisted cancellation intent, when an operator has requested shutdown.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation: Option<DelegationCancellation>,
     },
     /// Final outcome; no worker may mutate the run after this transition.
     Terminal {

@@ -306,6 +306,13 @@ pub trait DelegationStore: Send {
         delegation_id: &DelegationId,
     ) -> Result<DelegationSnapshot, DelegationStoreError>;
 
+    /// List one parent's runs in deterministic newest-first order.
+    fn list_for_parent(
+        &mut self,
+        parent_session_id: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<DelegationSnapshot>, DelegationStoreError>;
+
     /// List unclaimed work in deterministic creation order.
     fn pending(&mut self, limit: usize) -> Result<Vec<DelegationSnapshot>, DelegationStoreError>;
 
@@ -327,6 +334,19 @@ pub trait DelegationStore: Send {
         fencing_token: FencingToken,
         now_ms: u64,
         lease_expires_at_ms: u64,
+    ) -> Result<DelegationSnapshot, DelegationStoreError>;
+
+    /// Persist cancellation before any live worker is signalled.
+    ///
+    /// Pending work becomes terminal immediately. Running work retains its
+    /// generation and fencing authority, but may thereafter commit only the
+    /// matching cancelled terminal.
+    fn cancel(
+        &mut self,
+        delegation_id: &DelegationId,
+        expected_generation: OwnerGeneration,
+        reason: &str,
+        requested_at_ms: u64,
     ) -> Result<DelegationSnapshot, DelegationStoreError>;
 
     /// Atomically record a terminal child outcome and its one completion event.

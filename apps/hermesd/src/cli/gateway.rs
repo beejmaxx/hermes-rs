@@ -11,11 +11,12 @@ use std::{
 
 use anyhow::Context;
 use domain::{
-    DeliveryClaimId, ForegroundTurnId, ForegroundTurnSpec, ForegroundTurnState,
-    ForegroundTurnTerminal, OwnerGeneration, SemanticMessage, SessionId,
+    DelegationId, DelegationState, DeliveryClaimId, ForegroundTurnId, ForegroundTurnSpec,
+    ForegroundTurnState, ForegroundTurnTerminal, OwnerGeneration, SemanticMessage, SessionId,
 };
 use ports::{
-    DelegationStore, ForegroundTurnStore, ForegroundTurnStoreError, SessionStore, SessionStoreError,
+    DelegationStore, DelegationStoreError, ForegroundTurnStore, ForegroundTurnStoreError,
+    SessionStore, SessionStoreError,
 };
 use protocol::{
     DelegationCompletion, ForegroundTurnSnapshot, GatewayEventFrame, GatewayFailure,
@@ -26,7 +27,7 @@ use serde_json::{Map, Value, json};
 use tokio::{io::AsyncBufReadExt, sync::oneshot, task::JoinHandle};
 
 use super::{
-    background::BackgroundSupervisor,
+    background::{BackgroundControl, BackgroundSupervisor},
     chat::{LiveSettings, RuntimeArgs, completed_response, execute_turn_observed},
     state::state_path,
 };
@@ -38,6 +39,9 @@ const DELEGATION_RESTART_RECONCILIATION_REASON: &str =
     "owning gateway exited before recording a background delegation terminal";
 const COMPLETION_DELIVERY_LIMIT: usize = 32;
 const DELIVERY_CLAIM_DURATION_MS: u64 = 30_000;
+const DEFAULT_DELEGATION_LIST_LIMIT: usize = 100;
+const MAX_DELEGATION_LIST_LIMIT: usize = 500;
+const DEFAULT_CANCELLATION_REASON: &str = "client requested background cancellation";
 
 /// Arguments for the long-lived stdio gateway host.
 #[derive(Debug, clap::Args)]
@@ -71,7 +75,8 @@ pub async fn run_gateway(
             "reconciled_delegations": reconciled_delegations.len(),
         })),
     ))?;
-    let _background = BackgroundSupervisor::spawn(state.clone());
+    let background = BackgroundSupervisor::spawn(state.clone());
+    let background_control = background.control();
 
     let mut host = GatewayHost {
         settings,
@@ -79,6 +84,7 @@ pub async fn run_gateway(
         writer,
         busy: Arc::new(Mutex::new(HashSet::new())),
         controls: Arc::new(Mutex::new(HashMap::new())),
+        background_control,
         turns: Vec::new(),
     };
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
@@ -103,6 +109,7 @@ pub async fn run_gateway(
     for turn in host.turns {
         let _ = turn.await;
     }
+    drop(background);
     Ok(())
 }
 
@@ -112,6 +119,7 @@ struct GatewayHost {
     writer: FrameWriter,
     busy: Arc<Mutex<HashSet<String>>>,
     controls: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+    background_control: BackgroundControl,
     turns: Vec<JoinHandle<()>>,
 }
 
@@ -205,6 +213,9 @@ impl GatewayHost {
             "session.list" => self.list_sessions(false),
             "session.active_list" => self.list_sessions(true),
             "session.most_recent" => self.most_recent_session(),
+            "delegation.list" => self.list_delegations(params),
+            "delegation.status" => self.delegation_status(params),
+            "delegation.cancel" => self.cancel_delegation(params),
             "input.detect_drop" => {
                 let _ = session_param(params)?;
                 Ok(json!({"matched": false}))
@@ -331,6 +342,135 @@ impl GatewayHost {
             }),
             None => json!({"session_id": null}),
         })
+    }
+
+    fn list_delegations(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
+        let session_id = self.authorized_parent(params)?;
+        let limit = params
+            .get("limit")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| (1..=MAX_DELEGATION_LIST_LIMIT).contains(value))
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            -32602,
+                            format!(
+                                "delegation limit must be between 1 and {MAX_DELEGATION_LIST_LIMIT}"
+                            ),
+                        )
+                    })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_DELEGATION_LIST_LIMIT);
+        let delegations = SqliteDelegationStore::open(&self.state)
+            .map_err(internal_error)?
+            .list_for_parent(&session_id, limit)
+            .map_err(delegation_rpc_error)?;
+        Ok(json!({"delegations": delegations}))
+    }
+
+    fn delegation_status(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
+        let session_id = self.authorized_parent(params)?;
+        let delegation_id = delegation_param(params)?;
+        let delegation = self.load_owned_delegation(&session_id, &delegation_id)?;
+        Ok(json!({"delegation": delegation}))
+    }
+
+    fn cancel_delegation(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
+        let session_id = self.authorized_parent(params)?;
+        let delegation_id = delegation_param(params)?;
+        let requested_reason = params
+            .get("reason")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|reason| !reason.trim().is_empty() && reason.trim() == *reason)
+                    .ok_or_else(|| {
+                        RpcError::new(
+                            -32602,
+                            "cancellation reason must be non-empty with no surrounding whitespace",
+                        )
+                    })
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_CANCELLATION_REASON);
+
+        for _ in 0..3 {
+            let current = self.load_owned_delegation(&session_id, &delegation_id)?;
+            match &current.state {
+                DelegationState::Terminal { .. } => {
+                    return Ok(json!({
+                        "accepted": false,
+                        "already_terminal": true,
+                        "delegation": current,
+                    }));
+                }
+                DelegationState::Running { cancellation: Some(cancellation), .. } => {
+                    let signalled = self
+                        .background_control
+                        .signal(delegation_id.as_str(), cancellation.reason.clone());
+                    return Ok(json!({
+                        "accepted": true,
+                        "already_requested": true,
+                        "signalled": signalled,
+                        "delegation": current,
+                    }));
+                }
+                DelegationState::Pending | DelegationState::Running { .. } => {}
+            }
+            let now_ms = unix_time_ms().map_err(internal_error)?;
+            let cancelled = SqliteDelegationStore::open(&self.state)
+                .map_err(internal_error)?
+                .cancel(&delegation_id, current.owner_generation, requested_reason, now_ms);
+            match cancelled {
+                Ok(cancelled) => {
+                    let signalled = self
+                        .background_control
+                        .signal(delegation_id.as_str(), requested_reason.into());
+                    return Ok(json!({
+                        "accepted": true,
+                        "already_requested": false,
+                        "signalled": signalled,
+                        "delegation": cancelled,
+                    }));
+                }
+                Err(DelegationStoreError::GenerationConflict { .. }) => continue,
+                Err(error) => return Err(delegation_rpc_error(error)),
+            }
+        }
+        Err(RpcError::new(
+            4093,
+            "delegation ownership kept changing while cancellation was requested",
+        ))
+    }
+
+    fn authorized_parent(&self, params: &Map<String, Value>) -> Result<SessionId, RpcError> {
+        let session_id = SessionId::new(session_param(params)?)
+            .map_err(|error| RpcError::new(4000, error.to_string()))?;
+        SqliteSessionStore::open(&self.state).map_err(internal_error)?.load(&session_id).map_err(
+            |error| match error {
+                SessionStoreError::NotFound(_) => RpcError::new(4040, error.to_string()),
+                other => internal_error(other),
+            },
+        )?;
+        Ok(session_id)
+    }
+
+    fn load_owned_delegation(
+        &self,
+        parent_session_id: &SessionId,
+        delegation_id: &DelegationId,
+    ) -> Result<protocol::DelegationSnapshot, RpcError> {
+        let delegation = SqliteDelegationStore::open(&self.state)
+            .map_err(internal_error)?
+            .load(delegation_id)
+            .map_err(delegation_rpc_error)?;
+        if delegation.spec.parent_session_id != *parent_session_id {
+            return Err(RpcError::new(4041, format!("delegation not found: {delegation_id}")));
+        }
+        Ok(delegation)
     }
 
     fn interrupt_session(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
@@ -891,6 +1031,15 @@ fn session_param(params: &Map<String, Value>) -> Result<&str, RpcError> {
         .ok_or_else(|| RpcError::new(-32602, "session_id is required"))
 }
 
+fn delegation_param(params: &Map<String, Value>) -> Result<DelegationId, RpcError> {
+    let value = params
+        .get("delegation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RpcError::new(-32602, "delegation_id is required"))?;
+    DelegationId::new(value).map_err(|error| RpcError::new(4000, error.to_string()))
+}
+
 fn fresh_session_id() -> anyhow::Result<SessionId> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -944,6 +1093,18 @@ fn foreground_rpc_error(error: ForegroundTurnStoreError) -> RpcError {
         ForegroundTurnStoreError::NotFound(_) | ForegroundTurnStoreError::Storage(_) => {
             internal_error(error)
         }
+    }
+}
+
+fn delegation_rpc_error(error: DelegationStoreError) -> RpcError {
+    match error {
+        DelegationStoreError::NotFound(_) => RpcError::new(4041, error.to_string()),
+        DelegationStoreError::AlreadyExists(_)
+        | DelegationStoreError::NotClaimable { .. }
+        | DelegationStoreError::GenerationConflict { .. }
+        | DelegationStoreError::FencingConflict { .. } => RpcError::new(4093, error.to_string()),
+        DelegationStoreError::Invalid(_) => RpcError::new(4002, error.to_string()),
+        DelegationStoreError::Storage(_) => internal_error(error),
     }
 }
 

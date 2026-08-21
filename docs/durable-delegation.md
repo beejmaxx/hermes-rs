@@ -16,6 +16,7 @@ transitions.
 pending ─────────────────────────────────────────> running
    │                                                 │
    │ safe to start after restart                     │ finish(generation + fence)
+   │ cancel(expected generation)                     │ cancel intent (same generation)
    │                                                 │
    │                                  ┌──────────────┴──────────────┐
    │                                  │                             │
@@ -47,14 +48,28 @@ terminal write supplies both the expected current generation and that fencing
 token. A stale worker can therefore neither extend nor finish a run after
 another authoritative transition.
 
+Cancellation follows the same ownership rules. Cancelling `pending` work
+atomically writes a cancelled terminal and completion before it can be
+dispatched. Cancelling `running` work records the reason and request timestamp
+without transferring worker ownership or advancing its generation. From that
+commit onward, the fenced worker's only legal terminal is `cancelled` with the
+exact persisted reason; success, failure, and child-transcript writes are
+rejected. The gateway then sends a best-effort live signal, while each worker
+also polls the durable record so a registration race cannot lose the request.
+If the owner disappears after that commit, startup or lease reconciliation
+finishes the persisted cancellation instead of degrading it to
+`outcome_unknown`.
+
 The supervisor never reclaims an expired `running` child. Model inference may
 be billable, and later capability sets may include effects whose outcome cannot
 be inferred after a crash. Lease expiry therefore records `outcome_unknown`.
 The gateway's exclusive OS lease also proves at startup that every owner left
 by the prior process is abandoned, so restart reconciliation does not wait for
-the wall-clock deadline. Only work still in `pending` is automatically safe to
-start after a restart. Replay of a running child requires an explicit policy
-proving its complete frozen capability set is replay-safe.
+the wall-clock deadline. An abandoned run with durable cancellation intent
+becomes `cancelled`; every other abandoned run becomes `outcome_unknown`. Only
+work still in `pending` is automatically safe to start after a restart. Replay
+of a running child requires an explicit policy proving its complete frozen
+capability set is replay-safe.
 
 ## Terminal and delivery atomicity
 
@@ -87,10 +102,16 @@ New gateway sessions freeze a background form of `delegate_task`. A call:
 - atomically commits the child turn, terminal, and completion outbox; and
 - is delivered exactly once with the next explicit parent prompt.
 
+The gateway exposes `delegation.list`, `delegation.status`, and
+`delegation.cancel` for one exact parent session. These methods operate on the
+same persisted snapshots used by the supervisor. A cancellation completion is
+delivered through the ordinary outbox path, so control does not create a
+second notification or prompt-injection mechanism.
+
 The ordinary `hermesd chat` command retains its synchronous leaf behavior; its
 frozen tool schema describes that different contract. The gateway never swaps
 either catalog during a lineage.
 
-Steering, cancellation requests, nested orchestrators, and retry of an expired
-running child remain later state transitions. They will extend this concrete
-lifecycle instead of introducing a generic workflow or Kanban task model.
+Steering, nested orchestrators, and retry of an expired running child remain
+later state transitions. They will extend this concrete lifecycle instead of
+introducing a generic workflow or Kanban task model.

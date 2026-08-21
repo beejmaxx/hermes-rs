@@ -28,6 +28,9 @@
 - Durable gateway delegation with atomic child/spec acceptance, leased and
   fenced workers, heartbeats, atomic child/outbox completion, exactly-once
   next-turn delivery, and real normal/crash process proofs
+- Parent-scoped background list/status/cancel controls with durable cancellation
+  intent, cooperative in-flight abort, cancellation-safe restart reconciliation,
+  and a real provider-in-flight process proof
 
 ## Current package decisions
 

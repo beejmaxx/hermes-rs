@@ -470,6 +470,213 @@ async fn background_delegation_runs_and_is_delivered_with_the_next_user_turn()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn running_background_delegation_can_be_listed_and_cancelled_durably()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = tempdir()?;
+    let workspace = tempdir()?;
+    let root = fs::canonicalize(workspace.path())?;
+    let database = state_dir.path().join("state.db");
+    let server = MockServer::start().await;
+    let system = "Use durable background delegation when asked.";
+    let goal = "Perform an inspection that the operator may cancel.";
+    let child_system = format!(
+        "You are a focused leaf subagent. You cannot delegate, interact with the user, or modify files. Inspect the workspace at {} with read-only tools when useful.\n\nTASK:\n{goal}",
+        root.display()
+    );
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("start cancellable background work"))
+        .and(matchers::body_string_contains("durable leaf-agent session"))
+        .respond_with(tool_call("delegate-cancellable", "delegate_task", json!({"goal": goal})))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("Queued background delegation"))
+        .respond_with(streaming_text("The cancellable task is queued."))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": child_system},
+                {
+                    "role": "user",
+                    "content": "Complete the assigned task and return a concise result for the parent agent."
+                }
+            ],
+            "tools": ReadOnlyLocalTools::catalog(),
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .respond_with(
+            streaming_text("This cancelled result must never be committed.")
+                .set_delay(Duration::from_secs(10)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("<background_completion"))
+        .and(matchers::body_string_contains("\"status\": \"cancelled\""))
+        .and(matchers::body_string_contains("confirm the cancellation"))
+        .respond_with(streaming_text("The background task was cancelled."))
+        .mount(&server)
+        .await;
+
+    let mut gateway = GatewayProcess::spawn(&[
+        "--state",
+        path_text(&database)?,
+        "gateway",
+        "--provider",
+        "custom",
+        "--base-url",
+        &format!("{}/v1", server.uri()),
+        "--model",
+        "test-model",
+        "--root",
+        path_text(&root)?,
+        "--system",
+        system,
+    ])?;
+    let _ready = gateway.read_frame()?;
+    gateway.request("create", "session.create", json!({}))?;
+    let created = gateway.read_response("create")?;
+    let parent_id = created["result"]["session_id"]
+        .as_str()
+        .ok_or("session.create omitted session_id")?
+        .to_owned();
+    gateway.request(
+        "dispatch",
+        "prompt.submit",
+        json!({"session_id": parent_id, "text": "start cancellable background work"}),
+    )?;
+    let _accepted = gateway.read_response("dispatch")?;
+    read_until_session_info(&mut gateway, &parent_id)?;
+
+    let mut running = None;
+    for attempt in 0..200 {
+        let request_id = format!("list-{attempt}");
+        gateway.request(
+            &request_id,
+            "delegation.list",
+            json!({"session_id": parent_id, "limit": 10}),
+        )?;
+        let response = gateway.read_response(&request_id)?;
+        if response["result"]["delegations"][0]["state"]["state"] == "running" {
+            running = Some(response["result"]["delegations"][0].clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let running = running.ok_or("delegation did not enter running state")?;
+    let delegation_id = running["spec"]["delegation_id"]
+        .as_str()
+        .ok_or("delegation.list omitted delegation_id")?
+        .to_owned();
+
+    gateway.request(
+        "status-running",
+        "delegation.status",
+        json!({"session_id": parent_id, "delegation_id": delegation_id}),
+    )?;
+    assert_eq!(
+        gateway.read_response("status-running")?["result"]["delegation"]["state"]["state"],
+        "running"
+    );
+    let mut child_request_started = false;
+    for _ in 0..200 {
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or("request recording is disabled on the mock server")?;
+        if requests.iter().any(|request| {
+            serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
+                body["messages"][0]["content"].as_str() == Some(child_system.as_str())
+            })
+        }) {
+            child_request_started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(child_request_started, "child provider request did not start before cancellation");
+    gateway.request(
+        "cancel",
+        "delegation.cancel",
+        json!({
+            "session_id": parent_id,
+            "delegation_id": delegation_id,
+            "reason": "operator ended the experiment"
+        }),
+    )?;
+    let cancelled = gateway.read_response("cancel")?;
+    assert_eq!(cancelled["result"]["accepted"], true);
+    assert_eq!(
+        cancelled["result"]["delegation"]["state"]["cancellation"]["reason"],
+        "operator ended the experiment"
+    );
+
+    let parent_session_id = domain::SessionId::new(&parent_id)?;
+    let completion = wait_for_completion(&database, &parent_session_id).await?;
+    assert_eq!(completion.delegation_id.as_str(), delegation_id);
+    assert!(matches!(
+        &completion.outcome,
+        DelegationTerminal::Cancelled { reason } if reason == "operator ended the experiment"
+    ));
+    let delegation = SqliteDelegationStore::open(&database)?.load(&completion.delegation_id)?;
+    assert!(matches!(
+        delegation.state,
+        DelegationState::Terminal { outcome: DelegationTerminal::Cancelled { .. }, .. }
+    ));
+    assert!(
+        SqliteSessionStore::open(&database)?
+            .load(&delegation.spec.child_session_id)?
+            .conversation
+            .is_empty()
+    );
+
+    gateway.request(
+        "status-cancelled",
+        "delegation.status",
+        json!({"session_id": parent_id, "delegation_id": delegation_id}),
+    )?;
+    assert_eq!(
+        gateway.read_response("status-cancelled")?["result"]["delegation"]["state"]["outcome"]["status"],
+        "cancelled"
+    );
+    gateway.request(
+        "delivery",
+        "prompt.submit",
+        json!({"session_id": parent_id, "text": "confirm the cancellation"}),
+    )?;
+    assert_eq!(gateway.read_response("delivery")?["result"]["delivered_background_completions"], 1);
+    read_until_session_info(&mut gateway, &parent_id)?;
+    assert!(
+        SqliteDelegationStore::open(&database)?
+            .available_completions_for(&parent_session_id, i64::MAX as u64, 10)?
+            .is_empty()
+    );
+    let child_request_count = server
+        .received_requests()
+        .await
+        .ok_or("request recording is disabled on the mock server")?
+        .iter()
+        .filter(|request| {
+            serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
+                body["messages"][0]["content"].as_str() == Some(child_system.as_str())
+            })
+        })
+        .count();
+    assert_eq!(child_request_count, 1);
+    gateway.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn killed_background_worker_reconciles_unknown_without_replay()
 -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = tempdir()?;
