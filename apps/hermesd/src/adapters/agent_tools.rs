@@ -480,6 +480,7 @@ fn enqueue_child(
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?,
+        engine_config: parent.config.engine_config,
         transport: parent.config.transport,
         provider_adapter: parent.config.provider_adapter,
         base_url: parent.config.base_url,

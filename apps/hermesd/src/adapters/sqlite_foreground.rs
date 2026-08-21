@@ -797,6 +797,7 @@ mod tests {
                 ManifestDigest::new(digest(system_prompt.as_bytes()))?,
                 ManifestDigest::new(digest(&serde_json::to_vec(&tools)?))?,
             )?,
+            engine_config: protocol::EngineConfig::Direct,
             transport: TransportKind::ChatCompletions,
             provider_adapter: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),

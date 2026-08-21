@@ -12,7 +12,7 @@ use std::{
 
 use hermesd::adapters::{SqliteEffectLedger, SqliteSessionStore};
 use ports::{EffectLedger, SessionStore};
-use protocol::TransportKind;
+use protocol::{CodexAuthorityProfile, EngineConfig, ModelReasoningEffort, TransportKind};
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
@@ -96,10 +96,35 @@ async fn codex_gateway_uses_terminal_approval_persists_and_projects_history()
     assert_eq!(resumed["result"]["messages"][4]["text"], "what happened?");
     gateway.shutdown()?;
 
+    let changed_effort = Command::new(env!("CARGO_BIN_EXE_hermesd"))
+        .args([
+            "--state",
+            path_text(&database)?,
+            "chat",
+            "--session",
+            &session_id,
+            "--reasoning",
+            "high",
+            "try to change the frozen effort",
+        ])
+        .output()?;
+    assert!(!changed_effort.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed_effort.stderr)
+            .contains("--reasoning cannot change for an existing session")
+    );
+
     let session_id = domain::SessionId::new(session_id)?;
     let snapshot = SqliteSessionStore::open(&database)?.load(&session_id)?;
     assert_eq!(snapshot.config.transport, TransportKind::CodexAppServer);
     assert_eq!(snapshot.config.provider_adapter, "codex-app-server");
+    assert_eq!(
+        snapshot.config.engine_config,
+        EngineConfig::CodexAppServer {
+            reasoning_effort: ModelReasoningEffort::Low,
+            authority_profile: CodexAuthorityProfile::HermesOwnedEffectsV1,
+        }
+    );
     assert_eq!(snapshot.owner_generation.get(), 3);
     assert_eq!(snapshot.conversation.len(), 6);
     assert!(SqliteEffectLedger::open(&database)?.pending()?.is_empty());
@@ -329,6 +354,7 @@ require_text '"method":"turn/start"'
 require_text '"environments":[]'
 require_text '"approvalPolicy":"never"'
 require_text '"sandboxPolicy":{{"type":"readOnly","networkAccess":false}}'
+require_text '"effort":"low"'
 if [ "$count" -eq 1 ]; then
   require_text 'create the approved marker'
 else

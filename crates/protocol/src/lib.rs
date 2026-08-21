@@ -52,6 +52,78 @@ pub enum TransportKind {
     GeminiNative,
 }
 
+/// Model reasoning budget frozen for the lifetime of a session lineage.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelReasoningEffort {
+    /// Disable deliberate reasoning when the selected model supports it.
+    None,
+    /// Use the smallest model-supported reasoning budget.
+    Minimal,
+    /// Prefer low latency over extended deliberation.
+    Low,
+    /// Use a balanced reasoning budget.
+    Medium,
+    /// Use an extended reasoning budget.
+    High,
+    /// Use an extra-high reasoning budget.
+    Xhigh,
+    /// Use the model's maximum reasoning budget.
+    Max,
+    /// Use the model's ultra reasoning budget.
+    Ultra,
+}
+
+impl ModelReasoningEffort {
+    /// Exact value sent to a cognitive engine.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+}
+
+/// Versioned authority contract applied to a supervised Codex worker.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAuthorityProfile {
+    /// Codex owns cognition while every model-visible effect is hosted by Hermes.
+    HermesOwnedEffectsV1,
+}
+
+impl CodexAuthorityProfile {
+    /// Stable identity included in the immutable engine manifest.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HermesOwnedEffectsV1 => "hermes_owned_effects_v1",
+        }
+    }
+}
+
+/// Engine-specific settings that must not drift during a session lineage.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "engine", rename_all = "snake_case")]
+pub enum EngineConfig {
+    /// Hermes owns the complete model-and-tool loop.
+    Direct,
+    /// Hermes supervises an external Codex app-server reasoning loop.
+    CodexAppServer {
+        /// Explicit reasoning effort, independent of mutable user-level Codex config.
+        reasoning_effort: ModelReasoningEffort,
+        /// Versioned worker authority policy applied to every thread and turn.
+        authority_profile: CodexAuthorityProfile,
+    },
+}
+
 /// OpenAI-compatible function payload nested inside a tool call.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +241,8 @@ pub struct SessionConfig {
     pub lineage_id: LineageId,
     /// Frozen engine and prompt/tool byte identity.
     pub prompt_manifest: PromptManifest,
+    /// Frozen engine-specific behavior and authority settings.
+    pub engine_config: EngineConfig,
     /// Provider transport used for every turn in this lineage.
     pub transport: TransportKind,
     /// Stable provider-adapter name such as `openai` or `openrouter`.

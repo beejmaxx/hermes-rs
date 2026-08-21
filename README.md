@@ -86,6 +86,7 @@ cargo run -p hermesd -- chat \
   --engine codex \
   --codex-command /absolute/path/to/codex \
   --model gpt-5.6-sol \
+  --reasoning low \
   --root . \
   "Read Cargo.toml and list the workspace packages."
 ```
@@ -94,7 +95,10 @@ This does not copy ChatGPT credentials into Hermes RS. Codex app-server owns
 its login and model connection; Hermes exposes only its frozen dynamic tools
 and journals every resulting invocation. The current integration starts a
 fresh ephemeral Codex thread per turn; durable native thread resume is the next
-lifecycle slice.
+lifecycle slice. Reasoning effort defaults to `low` for a new Codex session and
+is frozen with the authority profile in its immutable engine configuration;
+pass `--reasoning medium`, `high`, or another supported level when creating the
+session if a larger budget is worth the latency.
 
 Add `--session NAME` to create a durable lineage or resume it in a later
 process. Its provider, model, prompt, tool catalog, and root are immutable:

@@ -108,6 +108,9 @@ may propose a dynamic tool call; only `ToolHost` can issue its invocation
 identity, journal and execute it, and return the terminal evidence. Hermes
 retains the canonical semantic transcript. The Codex thread identity and
 capability manifest are opaque binding evidence, not conversation authority.
+The selected reasoning effort and versioned authority profile are part of the
+immutable session engine configuration, so a later process cannot change model
+behavior by inheriting a different user-level Codex configuration.
 
 The CLI and stdio gateway can select this engine explicitly. The current host
 still opens one ephemeral worker thread per turn; for later turns it projects

@@ -1694,7 +1694,8 @@ mod tests {
 
         let connection = Connection::open(&database)?;
         connection.execute_batch(
-            "DROP TABLE foreground_turns;
+            "ALTER TABLE sessions DROP COLUMN engine_config_json;
+             DROP TABLE foreground_turns;
              DROP TABLE delegation_completions;
              DROP TABLE delegations;
              PRAGMA user_version = 2;",
@@ -1713,7 +1714,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert_eq!(table_count, 3);
 
         let mut sessions = SqliteSessionStore::open(&database)?;
@@ -1779,6 +1780,7 @@ mod tests {
                 ManifestDigest::new(digest(system_prompt.as_bytes()))?,
                 ManifestDigest::new(digest(&serde_json::to_vec(&tools)?))?,
             )?,
+            engine_config: protocol::EngineConfig::Direct,
             transport: TransportKind::ChatCompletions,
             provider_adapter: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),

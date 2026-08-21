@@ -124,6 +124,7 @@ cargo run -p hermesd -- gateway \
   --engine codex \
   --codex-command /absolute/path/to/codex \
   --model gpt-5.6-sol \
+  --reasoning low \
   --root .
 ```
 
@@ -133,7 +134,9 @@ plugins, hooks, apps, multi-agent features, and effective user MCP servers for
 the worker. The Codex model may request a dynamic tool, but Rust issues the
 invocation identity and owns approval, execution, journaling, and the semantic
 transcript. Background delegation remains disabled for this engine until child
-turns can inherit the selected cognitive engine safely.
+turns can inherit the selected cognitive engine safely. The reasoning effort
+and versioned authority profile are frozen when the session is created;
+resuming it cannot silently inherit a changed user-level Codex configuration.
 
 It writes protocol frames—not a human interface—to stdout and reserves stderr
 for diagnostics. A normal user should launch it through a compatible client.
@@ -168,6 +171,7 @@ gateway \
   --engine codex \
   --codex-command /absolute/path/to/codex \
   --model gpt-5.6-sol \
+  --reasoning low \
   --root /absolute/path/to/your/workspace
 ```
 

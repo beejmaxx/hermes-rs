@@ -8,12 +8,15 @@ use domain::{
     ToolEffect, ToolResultStatus, ToolTerminal,
 };
 use ports::{EffectLedger, EffectLedgerError, SessionStore, SessionStoreError};
-use protocol::{PendingEffect, SessionConfig, SessionSnapshot, SessionSummary, TransportKind};
+use protocol::{
+    CodexAuthorityProfile, EngineConfig, PendingEffect, SessionConfig, SessionSnapshot,
+    SessionSummary, TransportKind,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 /// SQLite-backed single-writer durable session repository.
 pub struct SqliteSessionStore {
@@ -147,7 +150,7 @@ impl SqliteSessionStore {
                     )
                     .map_err(storage_error)?;
             }
-            2 | 3 | 4 | 5 | SCHEMA_VERSION => {}
+            2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION => {}
             other => {
                 return Err(SessionStoreError::Storage(format!(
                     "unsupported SQLite schema version {other}; expected {SCHEMA_VERSION}"
@@ -278,6 +281,21 @@ impl SqliteSessionStore {
                      ALTER TABLE delegations ADD COLUMN cancellation_reason TEXT;
                      ALTER TABLE delegations ADD COLUMN cancellation_requested_at_ms INTEGER;
                      PRAGMA user_version = 6;
+                     COMMIT;",
+                )
+                .map_err(storage_error)?;
+        }
+        if version <= 6 {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE sessions ADD COLUMN engine_config_json TEXT NOT NULL
+                         DEFAULT '{\"engine\":\"direct\"}';
+                     UPDATE sessions
+                        SET engine_config_json =
+                            '{\"engine\":\"codex_app_server\",\"reasoning_effort\":\"medium\",\"authority_profile\":\"hermes_owned_effects_v1\"}'
+                      WHERE provider_adapter = 'codex-app-server';
+                     PRAGMA user_version = 7;
                      COMMIT;",
                 )
                 .map_err(storage_error)?;
@@ -695,14 +713,16 @@ pub(super) fn create_session_in_transaction(
         OwnerGeneration::new(1).map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
     let tools_json = serde_json::to_string(&config.tools).map_err(storage_error)?;
     let transport_json = serde_json::to_string(&config.transport).map_err(storage_error)?;
+    let engine_config_json = serde_json::to_string(&config.engine_config).map_err(storage_error)?;
     transaction
         .execute(
             "INSERT INTO sessions (
                     session_id, lineage_id, owner_generation, engine_id, prompt_revision,
                     system_prompt_digest, tool_catalog_digest, transport_json, provider_adapter,
-                    base_url, api_key_env, model, tool_root, system_prompt, tools_json
+                    base_url, api_key_env, model, tool_root, system_prompt, tools_json,
+                    engine_config_json
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
                  )",
             params![
                 config.session_id.as_str(),
@@ -720,6 +740,7 @@ pub(super) fn create_session_in_transaction(
                 config.tool_root,
                 config.system_prompt,
                 tools_json,
+                engine_config_json,
             ],
         )
         .map_err(storage_error)?;
@@ -819,7 +840,8 @@ pub(super) fn load_snapshot(
             "SELECT
                 session_id, lineage_id, owner_generation, engine_id, prompt_revision,
                 system_prompt_digest, tool_catalog_digest, transport_json, provider_adapter,
-                base_url, api_key_env, model, tool_root, system_prompt, tools_json, message_count
+                base_url, api_key_env, model, tool_root, system_prompt, tools_json, message_count,
+                engine_config_json
              FROM sessions WHERE session_id = ?1",
             params![session_id.as_str()],
             |row| {
@@ -840,6 +862,7 @@ pub(super) fn load_snapshot(
                     system_prompt: row.get(13)?,
                     tools_json: row.get(14)?,
                     message_count: row.get(15)?,
+                    engine_config_json: row.get(16)?,
                 })
             },
         )
@@ -897,6 +920,13 @@ fn config_from_raw(raw: &RawSession) -> Result<SessionConfig, SessionStoreError>
                 .map_err(|error| SessionStoreError::Invalid(error.to_string()))?,
         )
         .map_err(|error| SessionStoreError::Invalid(error.to_string()))?,
+        engine_config: serde_json::from_str::<EngineConfig>(&raw.engine_config_json).map_err(
+            |error| {
+                SessionStoreError::Invalid(format!(
+                    "stored engine configuration is invalid: {error}"
+                ))
+            },
+        )?,
         transport: serde_json::from_str::<TransportKind>(&raw.transport_json).map_err(|error| {
             SessionStoreError::Invalid(format!("stored transport is invalid: {error}"))
         })?,
@@ -943,8 +973,25 @@ fn validate_config(config: &SessionConfig) -> Result<(), SessionStoreError> {
                     "Codex app-server sessions cannot persist an API endpoint or credential".into(),
                 ));
             }
+            if !matches!(
+                config.engine_config,
+                EngineConfig::CodexAppServer {
+                    authority_profile: CodexAuthorityProfile::HermesOwnedEffectsV1,
+                    ..
+                }
+            ) {
+                return Err(SessionStoreError::Invalid(
+                    "Codex app-server session requires a supervised Codex engine configuration"
+                        .into(),
+                ));
+            }
         }
         _ => {
+            if config.engine_config != EngineConfig::Direct {
+                return Err(SessionStoreError::Invalid(
+                    "direct provider transport requires direct engine configuration".into(),
+                ));
+            }
             if config.base_url.is_empty() || config.base_url.trim() != config.base_url {
                 return Err(SessionStoreError::Invalid(
                     "base URL must be non-empty and have no surrounding whitespace".into(),
@@ -1044,6 +1091,7 @@ struct RawSession {
     system_prompt: String,
     tools_json: String,
     message_count: i64,
+    engine_config_json: String,
 }
 
 struct RawSummary {
@@ -1090,7 +1138,7 @@ mod tests {
         ToolEffect, ToolResultStatus, ToolTerminal,
     };
     use ports::{EffectLedger, EffectLedgerError, SessionStore, SessionStoreError};
-    use protocol::{SessionConfig, TransportKind};
+    use protocol::{EngineConfig, SessionConfig, TransportKind};
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1111,6 +1159,7 @@ mod tests {
                 ManifestDigest::new(digest(system_prompt.as_bytes()))?,
                 ManifestDigest::new(digest(&serde_json::to_vec(&tools)?))?,
             )?,
+            engine_config: EngineConfig::Direct,
             transport: TransportKind::ChatCompletions,
             provider_adapter: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),

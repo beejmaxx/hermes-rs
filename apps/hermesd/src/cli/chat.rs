@@ -10,8 +10,8 @@ use clap::ValueEnum;
 use domain::{EngineId, LineageId, ManifestDigest, PromptManifest, SessionId};
 use ports::{SessionStore, SessionStoreError};
 use protocol::{
-    AgentTurnRequest, ContractOutcome, ProviderMessage, SessionConfig, SessionSnapshot,
-    TerminalStatus, TransportKind,
+    AgentTurnRequest, CodexAuthorityProfile, ContractOutcome, EngineConfig, ModelReasoningEffort,
+    ProviderMessage, SessionConfig, SessionSnapshot, TerminalStatus, TransportKind,
 };
 use runtime::JournaledToolBroker;
 use serde_json::Value;
@@ -51,6 +51,9 @@ pub(super) struct RuntimeArgs {
     /// Authenticated Codex executable used when --engine codex is selected.
     #[arg(long, value_name = "PATH")]
     codex_command: Option<PathBuf>,
+    /// Frozen Codex reasoning effort. Defaults to low for a new Codex session.
+    #[arg(long, value_enum)]
+    reasoning: Option<ReasoningEffortPreset>,
 }
 
 /// Arguments for one live chat turn.
@@ -87,6 +90,33 @@ enum EnginePreset {
     Codex,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ReasoningEffortPreset {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl From<ReasoningEffortPreset> for ModelReasoningEffort {
+    fn from(value: ReasoningEffortPreset) -> Self {
+        match value {
+            ReasoningEffortPreset::None => Self::None,
+            ReasoningEffortPreset::Minimal => Self::Minimal,
+            ReasoningEffortPreset::Low => Self::Low,
+            ReasoningEffortPreset::Medium => Self::Medium,
+            ReasoningEffortPreset::High => Self::High,
+            ReasoningEffortPreset::Xhigh => Self::Xhigh,
+            ReasoningEffortPreset::Max => Self::Max,
+            ReasoningEffortPreset::Ultra => Self::Ultra,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct LiveSettings {
     engine: EnginePreset,
@@ -98,6 +128,7 @@ pub(super) struct LiveSettings {
     system_prompt: String,
     tools: Vec<Value>,
     codex_command: Option<CodexAppServerCommand>,
+    engine_config: EngineConfig,
 }
 
 /// Execute one ephemeral or durable live agent turn.
@@ -325,12 +356,17 @@ async fn execute_turn_inner(
                 .codex_command
                 .clone()
                 .context("Codex engine has no configured app-server command")?;
-            let engine = CodexTurnEngine::new(
+            let mut engine = CodexTurnEngine::new(
                 command,
                 &settings.model,
                 &settings.root,
                 &settings.system_prompt,
             )?;
+            let EngineConfig::CodexAppServer { reasoning_effort, .. } = settings.engine_config
+            else {
+                anyhow::bail!("Codex session has incompatible frozen engine configuration");
+            };
+            engine = engine.with_effort(reasoning_effort.as_str());
             let request = CodexEngineTurnRequest {
                 execution_scope: scope.into(),
                 semantic_history,
@@ -406,10 +442,13 @@ impl LiveSettings {
         let root_input = arguments.root.as_deref().unwrap_or_else(|| Path::new("."));
         let root = std::fs::canonicalize(root_input)
             .with_context(|| format!("could not resolve tool root {}", root_input.display()))?;
-        let (base_url, api_key_env, codex_command) = match engine {
+        let (base_url, api_key_env, codex_command, engine_config) = match engine {
             EnginePreset::Direct => {
                 if arguments.codex_command.is_some() {
                     anyhow::bail!("--codex-command requires --engine codex");
+                }
+                if arguments.reasoning.is_some() {
+                    anyhow::bail!("--reasoning currently requires --engine codex");
                 }
                 let (default_base_url, default_api_key_env) = provider.defaults();
                 let base_url = arguments.base_url.as_deref().unwrap_or(default_base_url);
@@ -424,6 +463,7 @@ impl LiveSettings {
                         .clone()
                         .or_else(|| default_api_key_env.map(str::to_owned)),
                     None,
+                    EngineConfig::Direct,
                 )
             }
             EnginePreset::Codex => {
@@ -437,7 +477,18 @@ impl LiveSettings {
                 }
                 let executable =
                     arguments.codex_command.clone().unwrap_or_else(|| PathBuf::from("codex"));
-                (String::new(), None, Some(CodexAppServerCommand::new(executable)))
+                (
+                    String::new(),
+                    None,
+                    Some(CodexAppServerCommand::new(executable)),
+                    EngineConfig::CodexAppServer {
+                        reasoning_effort: arguments
+                            .reasoning
+                            .unwrap_or(ReasoningEffortPreset::Low)
+                            .into(),
+                        authority_profile: CodexAuthorityProfile::HermesOwnedEffectsV1,
+                    },
+                )
             }
         };
         let _validated_tools = ReadOnlyLocalTools::new(&root, "session-config-validation")?;
@@ -467,6 +518,7 @@ impl LiveSettings {
             system_prompt,
             tools,
             codex_command,
+            engine_config,
         })
     }
 
@@ -490,6 +542,9 @@ impl LiveSettings {
             EnginePreset::Direct => {
                 if arguments.codex_command.is_some() {
                     anyhow::bail!("--codex-command requires a Codex session");
+                }
+                if arguments.reasoning.is_some() {
+                    anyhow::bail!("--reasoning requires a Codex session");
                 }
                 let provider = ProviderPreset::from_adapter(&config.provider_adapter)?;
                 if arguments.provider.is_some_and(|value| value != provider) {
@@ -515,6 +570,7 @@ impl LiveSettings {
                     system_prompt: config.system_prompt.clone(),
                     tools: config.tools.clone(),
                     codex_command: None,
+                    engine_config: config.engine_config,
                 })
             }
             EnginePreset::Codex => {
@@ -525,6 +581,16 @@ impl LiveSettings {
                     anyhow::bail!(
                         "--provider, --base-url, and --api-key-env do not apply to a Codex session"
                     );
+                }
+                let EngineConfig::CodexAppServer { reasoning_effort, .. } = config.engine_config
+                else {
+                    anyhow::bail!("Codex session has incompatible frozen engine configuration");
+                };
+                if arguments
+                    .reasoning
+                    .is_some_and(|value| ModelReasoningEffort::from(value) != reasoning_effort)
+                {
+                    anyhow::bail!("--reasoning cannot change for an existing session");
                 }
                 Ok(Self::codex_from_snapshot(snapshot, arguments.codex_command.clone()))
             }
@@ -544,6 +610,7 @@ impl LiveSettings {
                 system_prompt: config.system_prompt.clone(),
                 tools: config.tools.clone(),
                 codex_command: None,
+                engine_config: config.engine_config,
             }),
             EnginePreset::Codex => Ok(Self::codex_from_snapshot(snapshot, None)),
         }
@@ -581,6 +648,7 @@ impl LiveSettings {
             codex_command: Some(CodexAppServerCommand::new(
                 command.unwrap_or_else(|| PathBuf::from("codex")),
             )),
+            engine_config: config.engine_config,
         }
     }
 
@@ -596,11 +664,23 @@ impl LiveSettings {
                     provider.as_str(),
                 )
             }
-            EnginePreset::Codex => (
-                format!("rust-v1:codex-app-server:{}", self.model),
-                TransportKind::CodexAppServer,
-                "codex-app-server",
-            ),
+            EnginePreset::Codex => {
+                let EngineConfig::CodexAppServer { reasoning_effort, authority_profile } =
+                    self.engine_config
+                else {
+                    anyhow::bail!("Codex session has incompatible engine configuration");
+                };
+                (
+                    format!(
+                        "rust-v1:codex-app-server:{}:effort={}:authority={}",
+                        self.model,
+                        reasoning_effort.as_str(),
+                        authority_profile.as_str()
+                    ),
+                    TransportKind::CodexAppServer,
+                    "codex-app-server",
+                )
+            }
         };
         let engine = EngineId::new(engine_id)?;
         let root = self.root.to_str().context("tool root is not valid UTF-8")?.to_owned();
@@ -613,6 +693,7 @@ impl LiveSettings {
                 ManifestDigest::new(digest(self.system_prompt.as_bytes()))?,
                 ManifestDigest::new(digest(&tools_bytes))?,
             )?,
+            engine_config: self.engine_config,
             transport,
             provider_adapter: provider_adapter.into(),
             base_url: self.base_url.clone(),
