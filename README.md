@@ -54,10 +54,10 @@ cargo run -p hermesd -- contract check contracts/hermes-v1
 
 The live path supports OpenAI, OpenRouter, and custom OpenAI-compatible
 endpoints. Credentials are read only from the selected environment variable;
-they are never accepted as command-line arguments. The enabled capabilities are
-read-only workspace inspection plus leaf delegation. Filesystem access is
-confined to `--root`; common credential paths such as `.env`, `.ssh`, and
-`.git` are denied even when they are beneath that root.
+they are never accepted as command-line arguments. `hermesd chat` exposes
+root-confined read-only workspace inspection plus leaf delegation. Common
+credential paths such as `.env`, `.ssh`, and `.git` are denied even when they
+are beneath that root.
 
 ```bash
 export OPENROUTER_API_KEY="..."
@@ -124,6 +124,12 @@ Hermes launcher does not select the Rust child yet, while the companion
 `beejmaxx/hermes-agent` fork can run it explicitly. See
 [docs/tui-gateway.md](docs/tui-gateway.md) for the exact supported method set
 launch command and current limitations.
+
+New gateway sessions additionally expose a real shell-backed `terminal` tool.
+Every call blocks on the Ink approval overlay; the plan is journaled before the
+prompt, and `once` or `deny` is persisted before dispatch or rejection. The
+working directory is the frozen root, but an approved command is not filesystem
+sandboxed. See [docs/terminal-approvals.md](docs/terminal-approvals.md).
 
 The bounded contracts, foreground turns, synchronous children, and durable
 gateway workers all use the same runtime.

@@ -9,10 +9,10 @@ use std::{
 
 use domain::{DelegationState, DelegationTerminal, ForegroundTurnState, ForegroundTurnTerminal};
 use hermesd::adapters::{
-    AgentTools, ReadOnlyLocalTools, SqliteDelegationStore, SqliteForegroundTurnStore,
-    SqliteSessionStore,
+    AgentTools, ReadOnlyLocalTools, SqliteDelegationStore, SqliteEffectLedger,
+    SqliteForegroundTurnStore, SqliteSessionStore,
 };
-use ports::{DelegationStore, ForegroundTurnStore, SessionStore};
+use ports::{DelegationStore, EffectLedger, ForegroundTurnStore, SessionStore};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
@@ -137,6 +137,238 @@ async fn stdio_client_can_create_prompt_and_resume_a_durable_session()
         .await
         .ok_or("request recording is disabled on the mock server")?;
     assert_eq!(requests.len(), 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn terminal_waits_for_gateway_approval_and_persists_each_decision()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = tempdir()?;
+    let workspace = tempdir()?;
+    let root = fs::canonicalize(workspace.path())?;
+    let database = state_dir.path().join("state.db");
+    let server = MockServer::start().await;
+    let system = "Use one explicitly approved terminal command when asked.";
+    let allow_prompt = "create the approved marker";
+    let deny_prompt = "create the denied marker";
+    let allow_command = "printf approved > approved.txt";
+    let deny_command = "printf denied > denied.txt";
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": allow_prompt}
+            ],
+            "tools": AgentTools::background_catalog(),
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .respond_with(tool_call("terminal-allow", "terminal", json!({"command": allow_command})))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("Command exited with status 0"))
+        .and(matchers::body_string_contains(allow_prompt))
+        .respond_with(streaming_text("The approved marker was created."))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": deny_prompt}
+            ],
+            "tools": AgentTools::background_catalog(),
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .respond_with(tool_call("terminal-deny", "terminal", json!({"command": deny_command})))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("User denied terminal command approval"))
+        .and(matchers::body_string_contains(deny_prompt))
+        .respond_with(streaming_text("The denied marker was not created."))
+        .mount(&server)
+        .await;
+
+    let mut gateway = GatewayProcess::spawn(&[
+        "--state",
+        path_text(&database)?,
+        "gateway",
+        "--provider",
+        "custom",
+        "--base-url",
+        &format!("{}/v1", server.uri()),
+        "--model",
+        "test-model",
+        "--root",
+        path_text(&root)?,
+        "--system",
+        system,
+    ])?;
+    let _ready = gateway.read_frame()?;
+
+    gateway.request("create-allow", "session.create", json!({}))?;
+    let allow_session = gateway.read_response("create-allow")?["result"]["session_id"]
+        .as_str()
+        .ok_or("allow session omitted session_id")?
+        .to_owned();
+    gateway.request(
+        "prompt-allow",
+        "prompt.submit",
+        json!({"session_id": allow_session, "text": allow_prompt}),
+    )?;
+    let _accepted = gateway.read_response("prompt-allow")?;
+    let approval = read_until_approval(&mut gateway, &allow_session)?;
+    assert_eq!(approval["params"]["payload"]["command"], allow_command);
+    assert_eq!(approval["params"]["payload"]["choices"], json!(["once", "deny"]));
+    assert!(!root.join("approved.txt").exists());
+    gateway.request(
+        "approve",
+        "approval.respond",
+        json!({"session_id": allow_session, "choice": "once"}),
+    )?;
+    let approved = read_response_and_session_info(&mut gateway, "approve", &allow_session)?;
+    assert_eq!(approved["result"]["resolved"], true);
+    assert_eq!(fs::read_to_string(root.join("approved.txt"))?, "approved");
+
+    gateway.request("create-deny", "session.create", json!({}))?;
+    let deny_session = gateway.read_response("create-deny")?["result"]["session_id"]
+        .as_str()
+        .ok_or("deny session omitted session_id")?
+        .to_owned();
+    gateway.request(
+        "prompt-deny",
+        "prompt.submit",
+        json!({"session_id": deny_session, "text": deny_prompt}),
+    )?;
+    let _accepted = gateway.read_response("prompt-deny")?;
+    let approval = read_until_approval(&mut gateway, &deny_session)?;
+    assert_eq!(approval["params"]["payload"]["command"], deny_command);
+    gateway.request(
+        "deny",
+        "approval.respond",
+        json!({"session_id": deny_session, "choice": "deny"}),
+    )?;
+    let denied = read_response_and_session_info(&mut gateway, "deny", &deny_session)?;
+    assert_eq!(denied["result"]["resolved"], true);
+    assert!(!root.join("denied.txt").exists());
+
+    let connection = rusqlite::Connection::open(&database)?;
+    let mut statement = connection.prepare(
+        "SELECT approval_json, status FROM tool_effects
+         WHERE name = 'terminal' ORDER BY execution_key ASC",
+    )?;
+    let decisions = statement
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(decisions.len(), 2);
+    let mut decisions = decisions
+        .into_iter()
+        .map(|(approval, status)| {
+            let approval = serde_json::from_str::<Value>(&approval)?;
+            Ok((approval["decision"].as_str().unwrap_or_default().to_owned(), status))
+        })
+        .collect::<Result<Vec<_>, serde_json::Error>>()?;
+    decisions.sort();
+    assert_eq!(
+        decisions,
+        vec![("allow".into(), "succeeded".into()), ("deny".into(), "rejected".into())]
+    );
+    gateway.shutdown()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupting_a_pending_terminal_approval_never_dispatches_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = tempdir()?;
+    let workspace = tempdir()?;
+    let root = fs::canonicalize(workspace.path())?;
+    let database = state_dir.path().join("state.db");
+    let server = MockServer::start().await;
+    let system = "Use one explicitly approved terminal command when asked.";
+    let prompt = "create a marker only if approval completes";
+    let command = "printf should-not-run > interrupted.txt";
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt}
+            ],
+            "tools": AgentTools::background_catalog(),
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .respond_with(tool_call("terminal-interrupt", "terminal", json!({"command": command})))
+        .mount(&server)
+        .await;
+
+    let mut gateway = GatewayProcess::spawn(&[
+        "--state",
+        path_text(&database)?,
+        "gateway",
+        "--provider",
+        "custom",
+        "--base-url",
+        &format!("{}/v1", server.uri()),
+        "--model",
+        "test-model",
+        "--root",
+        path_text(&root)?,
+        "--system",
+        system,
+    ])?;
+    let _ready = gateway.read_frame()?;
+    gateway.request("create", "session.create", json!({}))?;
+    let session_id = gateway.read_response("create")?["result"]["session_id"]
+        .as_str()
+        .ok_or("session.create omitted session_id")?
+        .to_owned();
+    gateway.request(
+        "prompt",
+        "prompt.submit",
+        json!({"session_id": session_id, "text": prompt}),
+    )?;
+    let _accepted = gateway.read_response("prompt")?;
+    let approval = read_until_approval(&mut gateway, &session_id)?;
+    assert_eq!(approval["params"]["payload"]["command"], command);
+
+    gateway.request("interrupt", "session.interrupt", json!({"session_id": session_id}))?;
+    let mut acknowledged = false;
+    let mut interrupted = false;
+    while !acknowledged || !interrupted {
+        let frame = gateway.read_frame()?;
+        if frame.get("id").and_then(Value::as_str) == Some("interrupt") {
+            acknowledged = true;
+        }
+        if frame["method"] == "event"
+            && frame["params"]["session_id"] == session_id
+            && frame["params"]["type"] == "message.complete"
+        {
+            assert_eq!(frame["params"]["payload"]["status"], "interrupted");
+            interrupted = true;
+        }
+    }
+    assert!(!root.join("interrupted.txt").exists());
+    let pending = SqliteEffectLedger::open(&database)?.pending()?;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].plan.name, "terminal");
+    assert!(pending[0].plan.approval.as_ref().is_some_and(domain::ApprovalRecord::pending));
+    gateway.shutdown()?;
     Ok(())
 }
 
@@ -834,6 +1066,48 @@ fn read_until_session_info(
             return Ok(());
         }
     }
+}
+
+fn read_until_approval(
+    gateway: &mut GatewayProcess,
+    session_id: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    loop {
+        let frame = gateway.read_frame()?;
+        if frame["method"] == "event"
+            && frame["params"]["session_id"] == session_id
+            && frame["params"]["type"] == "tool.start"
+        {
+            return Err("terminal tool started before approval resolved".into());
+        }
+        if frame["method"] == "event"
+            && frame["params"]["session_id"] == session_id
+            && frame["params"]["type"] == "approval.request"
+        {
+            return Ok(frame);
+        }
+    }
+}
+
+fn read_response_and_session_info(
+    gateway: &mut GatewayProcess,
+    response_id: &str,
+    session_id: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut response = None;
+    let mut completed = false;
+    while response.is_none() || !completed {
+        let frame = gateway.read_frame()?;
+        if frame.get("id").and_then(Value::as_str) == Some(response_id) {
+            response = Some(frame);
+        } else if frame["method"] == "event"
+            && frame["params"]["session_id"] == session_id
+            && frame["params"]["type"] == "session.info"
+        {
+            completed = true;
+        }
+    }
+    response.ok_or_else(|| "approval response was not received".into())
 }
 
 async fn wait_for_completion(

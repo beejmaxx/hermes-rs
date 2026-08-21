@@ -65,6 +65,25 @@ where
         Ok(plans)
     }
 
+    fn resolve_approvals<'a>(
+        &'a mut self,
+        calls: &'a [PlannedToolCall],
+    ) -> BoxFuture<'a, Result<Vec<PlannedToolCall>, ToolBrokerError>> {
+        async move {
+            let had_pending = calls
+                .iter()
+                .any(|call| call.approval.as_ref().is_some_and(domain::ApprovalRecord::pending));
+            let resolved = self.inner.resolve_approvals(calls).await?;
+            if had_pending {
+                self.ledger
+                    .record_approvals(&resolved)
+                    .map_err(|error| ToolBrokerError::new(error.to_string()))?;
+            }
+            Ok(resolved)
+        }
+        .boxed()
+    }
+
     fn execute<'a>(
         &'a mut self,
         calls: &'a [PlannedToolCall],
@@ -495,13 +514,27 @@ where
                 let planned = tools.plan(&calls)?;
                 validate_plans(&calls, &planned)?;
                 for call in &planned {
-                    persistence_intents.push(planned_intent(call));
                     if let Some(approval) = &call.approval {
-                        events.push(json!({
+                        let mut request = json!({
                             "type": "approval.request",
                             "call_id": call.call_id,
                             "requirement": approval,
-                        }))?;
+                        });
+                        if approval.pending()
+                            && let Some(request) = request.as_object_mut()
+                        {
+                            request.insert("name".into(), json!(call.name));
+                            request.insert("arguments".into(), json!(call.arguments));
+                            request.insert("effect".into(), json!(call.effect));
+                        }
+                        events.push(request)?;
+                    }
+                }
+                let resolved = tools.resolve_approvals(&planned).await?;
+                validate_approval_resolution(&planned, &resolved)?;
+                for call in &resolved {
+                    persistence_intents.push(planned_intent(call));
+                    if let Some(approval) = &call.approval {
                         events.push(json!({
                             "type": "approval.resolved",
                             "call_id": call.call_id,
@@ -523,8 +556,8 @@ where
                     }
                 }
 
-                let completed = tools.execute(&planned).await?;
-                validate_terminals(&planned, &completed)?;
+                let completed = tools.execute(&resolved).await?;
+                validate_terminals(&resolved, &completed)?;
                 let terminals_by_id = completed
                     .iter()
                     .map(|terminal| (terminal.call_id.clone(), terminal))
@@ -540,7 +573,7 @@ where
                     }))?;
                 }
 
-                let ordered = planned
+                let ordered = resolved
                     .iter()
                     .map(|plan| {
                         terminals_by_id.get(&plan.call_id).copied().ok_or_else(|| {
@@ -756,6 +789,51 @@ fn validate_plans(calls: &[ToolCall], plans: &[PlannedToolCall]) -> Result<(), R
         return Err(RuntimeError::InvalidTurn(
             "tool plans must be complete and ordered like model calls".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_approval_resolution(
+    planned: &[PlannedToolCall],
+    resolved: &[PlannedToolCall],
+) -> Result<(), RuntimeError> {
+    if planned.len() != resolved.len() {
+        return Err(RuntimeError::InvalidTurn(
+            "approval resolution must preserve every planned tool call".into(),
+        ));
+    }
+    for (planned, resolved) in planned.iter().zip(resolved) {
+        if planned.call_id != resolved.call_id
+            || planned.name != resolved.name
+            || planned.arguments != resolved.arguments
+            || planned.execution_key != resolved.execution_key
+            || planned.effect != resolved.effect
+        {
+            return Err(RuntimeError::InvalidTurn(
+                "approval resolution mutated a frozen tool plan".into(),
+            ));
+        }
+        match (&planned.approval, &resolved.approval) {
+            (None, None) => {}
+            (Some(before), Some(after)) if before.pending() => {
+                if after.pending()
+                    || !matches!(after.decision.as_str(), "allow" | "deny")
+                    || before.required != after.required
+                    || before.principal != after.principal
+                {
+                    return Err(RuntimeError::InvalidTurn(
+                        "pending approval did not resolve to a matching allow or deny decision"
+                            .into(),
+                    ));
+                }
+            }
+            (Some(before), Some(after)) if before == after => {}
+            _ => {
+                return Err(RuntimeError::InvalidTurn(
+                    "approval resolution changed a non-pending requirement".into(),
+                ));
+            }
+        }
     }
     Ok(())
 }

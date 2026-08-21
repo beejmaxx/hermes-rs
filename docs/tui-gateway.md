@@ -46,6 +46,7 @@ submit a prompt, and reopen its durable transcript:
 | Input | `input.detect_drop`, `complete.slash`, `complete.path`, `terminal.resize`, `system.battery` |
 | Turns | `prompt.submit` |
 | Background tasks | `delegation.list`, `delegation.status`, `delegation.cancel` |
+| Approvals | `approval.respond` (`once` or `deny`) |
 
 `prompt.submit` acknowledges with `{"status":"streaming"}` and emits
 `message.start`, zero or more `message.delta`, tool/reasoning events,
@@ -59,6 +60,12 @@ in its returned conformance log.
 before emitting a terminal `message.complete`, and leaves any tool invocation
 that was durably planned but did not reach a terminal in the effect ledger for
 operator reconciliation. It does not silently replay or discard that effect.
+
+New gateway sessions freeze an explicitly approved `terminal` tool. Its effect
+plan is durable before `approval.request`; `approval.respond` persists the
+decision before an allowed process starts. Denial never dispatches. The event
+shape and choices work with the existing Ink approval overlay. See
+[terminal-approvals.md](terminal-approvals.md).
 
 Every accepted prompt also has a durable foreground claim. On process restart,
 the next exclusive gateway owner marks any abandoned `running` claim
@@ -153,8 +160,9 @@ This is a usable vertical slice, not a claim of full gateway parity:
   does not expose it yet.
 - Session creation currently persists an empty frozen lineage immediately;
   Python delays that row until the first prompt.
-- Steer/queue, approvals, image attachment, shell/slash execution,
-  configuration mutation, and desktop/WebSocket methods are not implemented.
+- Steer/queue, image attachment, slash execution, configuration mutation, and
+  desktop/WebSocket methods are not implemented. Approval supports only
+  per-call terminal `once`/`deny`, not session or permanent policies.
 - Background-child steering, nested delegation, and replay of an ambiguous
   child outcome are not implemented.
 

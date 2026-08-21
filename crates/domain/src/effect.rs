@@ -41,6 +41,12 @@ impl ApprovalRecord {
     pub fn denied(&self) -> bool {
         self.decision == "deny"
     }
+
+    /// Whether this requirement is still waiting for an authorized principal.
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        self.decision == "pending"
+    }
 }
 
 /// A validated tool call plus its execution policy and deduplication identity.

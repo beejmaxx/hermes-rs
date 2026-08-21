@@ -1,15 +1,15 @@
 //! Session tool broker combining local inspection with isolated leaf delegation.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use domain::{
-    CompletionEventId, DelegationId, DelegationSpec, EngineId, LineageId, ManifestDigest,
-    PlannedToolCall, PromptManifest, SessionId, ToolArguments, ToolCall, ToolEffect,
-    ToolResultStatus, ToolTerminal,
+    ApprovalRecord, CompletionEventId, DelegationId, DelegationSpec, EngineId, LineageId,
+    ManifestDigest, PlannedToolCall, PromptManifest, SessionId, ToolArguments, ToolCall,
+    ToolCallId, ToolEffect, ToolResultStatus, ToolTerminal,
 };
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use ports::{DelegationStore, SessionStore, ToolBroker, ToolBrokerError};
@@ -20,10 +20,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{
+    approval::{ApprovalControl, ApprovalDecision},
     local_tools::{LocalToolsConfigError, ReadOnlyLocalTools},
     openai::{OpenAiCompatibleProvider, OpenAiProviderConfigError},
     sqlite::{SqliteEffectLedger, SqliteSessionStore},
     sqlite_delegation::SqliteDelegationStore,
+    terminal::TerminalTool,
 };
 use runtime::JournaledToolBroker;
 
@@ -58,6 +60,7 @@ pub struct AgentToolsConfig {
     state: PathBuf,
     delegation_enabled: bool,
     background_parent: Option<SessionId>,
+    terminal_approval: Option<(SessionId, ApprovalControl)>,
 }
 
 impl AgentToolsConfig {
@@ -84,6 +87,7 @@ impl AgentToolsConfig {
             state: state.into(),
             delegation_enabled,
             background_parent: None,
+            terminal_approval: None,
         })
     }
 
@@ -93,6 +97,17 @@ impl AgentToolsConfig {
         self.background_parent = Some(parent_session_id);
         self
     }
+
+    /// Enable the frozen terminal tool through one session-scoped approval channel.
+    #[must_use]
+    pub fn with_terminal_approval(
+        mut self,
+        session_id: SessionId,
+        control: ApprovalControl,
+    ) -> Self {
+        self.terminal_approval = Some((session_id, control));
+        self
+    }
 }
 
 /// Tool broker for a parent agent session.
@@ -100,6 +115,8 @@ pub struct AgentTools {
     local: ReadOnlyLocalTools,
     config: AgentToolsConfig,
     execution_scope: String,
+    pending_approvals: HashMap<ToolCallId, tokio::sync::oneshot::Receiver<ApprovalDecision>>,
+    registered_approvals: HashSet<ToolCallId>,
 }
 
 impl AgentTools {
@@ -110,7 +127,13 @@ impl AgentTools {
     ) -> Result<Self, AgentToolsConfigError> {
         let execution_scope = execution_scope.into();
         let local = ReadOnlyLocalTools::new(&config.root, &execution_scope)?;
-        Ok(Self { local, config, execution_scope })
+        Ok(Self {
+            local,
+            config,
+            execution_scope,
+            pending_approvals: HashMap::new(),
+            registered_approvals: HashSet::new(),
+        })
     }
 
     /// Ordered tool schemas advertised to new parent sessions.
@@ -159,6 +182,7 @@ impl AgentTools {
                 Value::String(BACKGROUND_DELEGATE_DESCRIPTION.into()),
             );
         }
+        tools.push(TerminalTool::schema());
         tools
     }
 
@@ -184,11 +208,31 @@ impl AgentTools {
                 == Some(DELEGATE_TOOL)
         })
     }
+
+    /// Whether an ordered frozen catalog exposes the approved terminal adapter.
+    #[must_use]
+    pub fn catalog_enables_terminal(catalog: &[Value]) -> bool {
+        catalog.iter().any(|tool| {
+            tool.get("function").and_then(|function| function.get("name")).and_then(Value::as_str)
+                == Some(TerminalTool::NAME)
+        })
+    }
 }
 
 impl ToolBroker for AgentTools {
     fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, ToolBrokerError> {
         let mut seen = HashSet::with_capacity(calls.len());
+        let terminal_calls = calls
+            .iter()
+            .filter(|call| {
+                self.config.terminal_approval.is_some() && call.name == TerminalTool::NAME
+            })
+            .count();
+        if terminal_calls > 1 {
+            return Err(ToolBrokerError::new(
+                "only one terminal call may be approved in a provider response",
+            ));
+        }
         calls
             .iter()
             .map(|call| {
@@ -198,21 +242,78 @@ impl ToolBroker for AgentTools {
                         call.id
                     )));
                 }
-                let effect = if self.config.delegation_enabled && call.name == DELEGATE_TOOL {
-                    ToolEffect::ModelInference
-                } else {
-                    ToolEffect::ReadOnly
-                };
+                let (effect, approval) =
+                    if self.config.delegation_enabled && call.name == DELEGATE_TOOL {
+                        (ToolEffect::ModelInference, None)
+                    } else if let Some((session_id, control)) = &self.config.terminal_approval
+                        && call.name == TerminalTool::NAME
+                    {
+                        let validation_plan = PlannedToolCall {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                            execution_key: format!("{}:{}", self.execution_scope, call.id),
+                            effect: ToolEffect::ProcessControl,
+                            approval: None,
+                        };
+                        TerminalTool::approval_command(&validation_plan)
+                            .map_err(ToolBrokerError::new)?;
+                        let receiver = control
+                            .register(session_id, call.id.clone())
+                            .map_err(|error| ToolBrokerError::new(error.to_string()))?;
+                        self.pending_approvals.insert(call.id.clone(), receiver);
+                        self.registered_approvals.insert(call.id.clone());
+                        (
+                            ToolEffect::ProcessControl,
+                            Some(ApprovalRecord {
+                                required: true,
+                                decision: "pending".into(),
+                                principal: "gateway_user".into(),
+                            }),
+                        )
+                    } else {
+                        (ToolEffect::ReadOnly, None)
+                    };
                 Ok(PlannedToolCall {
                     call_id: call.id.clone(),
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),
                     execution_key: format!("{}:{}", self.execution_scope, call.id),
                     effect,
-                    approval: None,
+                    approval,
                 })
             })
             .collect()
+    }
+
+    fn resolve_approvals<'a>(
+        &'a mut self,
+        calls: &'a [PlannedToolCall],
+    ) -> BoxFuture<'a, Result<Vec<PlannedToolCall>, ToolBrokerError>> {
+        async move {
+            let mut resolved = calls.to_vec();
+            for plan in &mut resolved {
+                if !plan.approval.as_ref().is_some_and(ApprovalRecord::pending) {
+                    continue;
+                }
+                let receiver = self.pending_approvals.remove(&plan.call_id).ok_or_else(|| {
+                    ToolBrokerError::new(format!(
+                        "tool call {} has no live approval waiter",
+                        plan.call_id
+                    ))
+                })?;
+                let decision = receiver.await.unwrap_or(ApprovalDecision::Deny);
+                let approval = plan.approval.as_mut().ok_or_else(|| {
+                    ToolBrokerError::new(format!(
+                        "tool call {} lost its approval requirement",
+                        plan.call_id
+                    ))
+                })?;
+                approval.decision = decision.as_str().into();
+            }
+            Ok(resolved)
+        }
+        .boxed()
     }
 
     fn execute<'a>(
@@ -220,11 +321,29 @@ impl ToolBroker for AgentTools {
         calls: &'a [PlannedToolCall],
     ) -> BoxFuture<'a, Result<Vec<ToolTerminal>, ToolBrokerError>> {
         async move {
-            let (delegated, local): (Vec<_>, Vec<_>) = calls
+            let (delegated, remaining): (Vec<_>, Vec<_>) = calls
                 .iter()
                 .cloned()
                 .partition(|call| self.config.delegation_enabled && call.name == DELEGATE_TOOL);
+            let (terminal_calls, local): (Vec<_>, Vec<_>) =
+                remaining.into_iter().partition(|call| {
+                    self.config.terminal_approval.is_some() && call.name == TerminalTool::NAME
+                });
             let mut completed = self.local.execute(&local).await?;
+            for plan in terminal_calls {
+                let decision =
+                    match plan.approval.as_ref().map(|approval| approval.decision.as_str()) {
+                        Some("allow") => ApprovalDecision::Allow,
+                        Some("deny") => ApprovalDecision::Deny,
+                        _ => {
+                            return Err(ToolBrokerError::new(format!(
+                                "terminal call {} reached dispatch without a final approval",
+                                plan.call_id
+                            )));
+                        }
+                    };
+                completed.push(TerminalTool::execute(self.local.root(), plan, decision).await);
+            }
             let mut children = delegated
                 .into_iter()
                 .map(|plan| {
@@ -238,6 +357,16 @@ impl ToolBroker for AgentTools {
             Ok(completed)
         }
         .boxed()
+    }
+}
+
+impl Drop for AgentTools {
+    fn drop(&mut self) {
+        if let Some((session_id, control)) = &self.config.terminal_approval {
+            for call_id in &self.registered_approvals {
+                control.remove(session_id, call_id);
+            }
+        }
     }
 }
 

@@ -18,8 +18,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::adapters::{
-    AgentTools, AgentToolsConfig, OpenAiCompatibleProvider, ReadOnlyLocalTools, SqliteEffectLedger,
-    SqliteSessionStore,
+    AgentTools, AgentToolsConfig, ApprovalControl, OpenAiCompatibleProvider, ReadOnlyLocalTools,
+    SqliteEffectLedger, SqliteSessionStore,
 };
 use crate::cli::state::state_path;
 
@@ -183,7 +183,31 @@ pub(super) async fn execute_turn(
     state: &Path,
     session_id: Option<&SessionId>,
 ) -> anyhow::Result<ContractOutcome> {
-    execute_turn_inner(settings, semantic_history, prompt, scope, state, session_id, None).await
+    execute_turn_inner(
+        settings,
+        semantic_history,
+        prompt,
+        scope,
+        state,
+        session_id,
+        TurnHooks { observer: None, approval_control: None },
+    )
+    .await
+}
+
+/// Live gateway surfaces paired for one observed foreground turn.
+pub(super) struct ObservedTurn<'a> {
+    observer: &'a mut dyn runtime::RuntimeEventObserver,
+    approval_control: &'a ApprovalControl,
+}
+
+impl<'a> ObservedTurn<'a> {
+    pub(super) fn new(
+        observer: &'a mut dyn runtime::RuntimeEventObserver,
+        approval_control: &'a ApprovalControl,
+    ) -> Self {
+        Self { observer, approval_control }
+    }
 }
 
 pub(super) async fn execute_turn_observed(
@@ -193,10 +217,21 @@ pub(super) async fn execute_turn_observed(
     scope: &str,
     state: &Path,
     session_id: Option<&SessionId>,
-    observer: &mut dyn runtime::RuntimeEventObserver,
+    observed: ObservedTurn<'_>,
 ) -> anyhow::Result<ContractOutcome> {
-    execute_turn_inner(settings, semantic_history, prompt, scope, state, session_id, Some(observer))
-        .await
+    execute_turn_inner(
+        settings,
+        semantic_history,
+        prompt,
+        scope,
+        state,
+        session_id,
+        TurnHooks {
+            observer: Some(observed.observer),
+            approval_control: Some(observed.approval_control),
+        },
+    )
+    .await
 }
 
 async fn execute_turn_inner(
@@ -206,7 +241,7 @@ async fn execute_turn_inner(
     scope: &str,
     state: &Path,
     session_id: Option<&SessionId>,
-    observer: Option<&mut dyn runtime::RuntimeEventObserver>,
+    hooks: TurnHooks<'_>,
 ) -> anyhow::Result<ContractOutcome> {
     let api_key = read_api_key(settings.api_key_env.as_deref())?;
     let mut provider = OpenAiCompatibleProvider::new(&settings.base_url, api_key.clone())?;
@@ -223,6 +258,14 @@ async fn execute_turn_inner(
             .context("durable background delegation requires an owning parent session")?;
         tools_config = tools_config.with_background_parent(parent.clone());
     }
+    if AgentTools::catalog_enables_terminal(&settings.tools) {
+        let session_id = session_id.context("terminal tool requires an owning session")?;
+        let approval_control = hooks
+            .approval_control
+            .context("terminal tool requires a live session approval channel")?;
+        tools_config =
+            tools_config.with_terminal_approval(session_id.clone(), approval_control.clone());
+    }
     let tools = AgentTools::new(tools_config, scope)?;
     let ledger = SqliteEffectLedger::open(state)
         .with_context(|| format!("could not open effect ledger {}", state.display()))?;
@@ -237,12 +280,17 @@ async fn execute_turn_inner(
         conversation,
         tools: settings.tools.clone(),
     };
-    match observer {
+    match hooks.observer {
         Some(observer) => runtime::run_turn_observed(request, &mut provider, &mut tools, observer)
             .await
             .map_err(Into::into),
         None => runtime::run_turn(request, &mut provider, &mut tools).await.map_err(Into::into),
     }
+}
+
+struct TurnHooks<'a> {
+    observer: Option<&'a mut dyn runtime::RuntimeEventObserver>,
+    approval_control: Option<&'a ApprovalControl>,
 }
 
 pub(super) fn completed_response(outcome: &ContractOutcome) -> anyhow::Result<&str> {
@@ -291,8 +339,13 @@ impl LiveSettings {
         let api_key_env =
             arguments.api_key_env.clone().or_else(|| default_api_key_env.map(str::to_owned));
         let system_prompt = arguments.system.clone().unwrap_or_else(|| {
+            let terminal = if AgentTools::catalog_enables_terminal(&tools) {
+                " You may propose one terminal command at a time; it runs only after the user explicitly approves it."
+            } else {
+                " Never claim to have modified files or run commands."
+            };
             format!(
-                "You are Hermes RS, a precise and helpful agent. You may inspect the workspace at {} using read_file and search_files. These tools are read-only. You may delegate focused independent subtasks to isolated leaf agents. Never claim to have modified files or run commands.",
+                "You are Hermes RS, a precise and helpful agent. You may inspect the workspace at {} using read_file and search_files. These tools are read-only. You may delegate focused independent subtasks to isolated leaf agents.{terminal}",
                 root.display()
             )
         });

@@ -100,6 +100,14 @@ history. Gateway startup reconciles a leftover `running` claim to
 `outcome_unknown` and surfaces it on resume without automatic replay. See
 [foreground-turns.md](foreground-turns.md).
 
+New gateway lineages also freeze a shell-backed terminal schema. The runtime
+pauses between durable planning and effect dispatch, projects an Ink-compatible
+approval request, and persists the final decision before either starting the
+process or recording rejection. The adapter bounds time and retained output;
+on Unix it owns a killable process group. This is an approval boundary rather
+than a filesystem sandbox. See
+[terminal-approvals.md](terminal-approvals.md).
+
 The stdio gateway connects the background-delegation substrate end to end:
 atomic child/spec acceptance, generation-guarded claims, heartbeating leases,
 worker fencing, atomic child-turn/terminal/outbox completion, conservative

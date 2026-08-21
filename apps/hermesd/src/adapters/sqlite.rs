@@ -3,9 +3,9 @@
 use std::{collections::HashSet, fs, path::Path, time::Duration};
 
 use domain::{
-    Conversation, EngineId, LineageId, ManifestDigest, OwnerGeneration, PlannedToolCall,
-    PromptManifest, SemanticMessage, SessionId, ToolArguments, ToolCallId, ToolEffect,
-    ToolResultStatus, ToolTerminal,
+    ApprovalRecord, Conversation, EngineId, LineageId, ManifestDigest, OwnerGeneration,
+    PlannedToolCall, PromptManifest, SemanticMessage, SessionId, ToolArguments, ToolCallId,
+    ToolEffect, ToolResultStatus, ToolTerminal,
 };
 use ports::{EffectLedger, EffectLedgerError, SessionStore, SessionStoreError};
 use protocol::{PendingEffect, SessionConfig, SessionSnapshot, SessionSummary, TransportKind};
@@ -365,6 +365,101 @@ impl EffectLedger for SqliteEffectLedger {
                             .map_err(ledger_storage_error)?,
                     ])
                     .map_err(ledger_storage_error)?;
+            }
+        }
+        transaction.commit().map_err(ledger_storage_error)
+    }
+
+    fn record_approvals(
+        &mut self,
+        resolved_plans: &[PlannedToolCall],
+    ) -> Result<(), EffectLedgerError> {
+        if resolved_plans.is_empty() {
+            return Err(EffectLedgerError::Invalid(
+                "cannot resolve approvals for an empty plan batch".into(),
+            ));
+        }
+        let mut keys = HashSet::with_capacity(resolved_plans.len());
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ledger_storage_error)?;
+        let mut pending_updates = Vec::new();
+        for plan in resolved_plans {
+            if !keys.insert(&plan.execution_key) {
+                return Err(EffectLedgerError::Invalid(format!(
+                    "duplicate execution key in approval batch: {}",
+                    plan.execution_key
+                )));
+            }
+            let recorded = transaction
+                .query_row(
+                    "SELECT status, call_id, name, arguments_json, effect_json, approval_json
+                     FROM tool_effects WHERE execution_key = ?1",
+                    params![plan.execution_key],
+                    |row| {
+                        Ok(RawApprovalPlan {
+                            status: row.get(0)?,
+                            call_id: row.get(1)?,
+                            name: row.get(2)?,
+                            arguments_json: row.get(3)?,
+                            effect_json: row.get(4)?,
+                            approval_json: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(ledger_storage_error)?
+                .ok_or_else(|| EffectLedgerError::MissingPlan(plan.execution_key.clone()))?;
+            if recorded.status != "planned" {
+                return Err(EffectLedgerError::AlreadyTerminal(plan.execution_key.clone()));
+            }
+            let arguments = serde_json::from_str::<ToolArguments>(&recorded.arguments_json)
+                .map_err(|error| EffectLedgerError::Invalid(error.to_string()))?;
+            let effect = serde_json::from_str::<ToolEffect>(&recorded.effect_json)
+                .map_err(|error| EffectLedgerError::Invalid(error.to_string()))?;
+            if recorded.call_id != plan.call_id.as_str()
+                || recorded.name != plan.name
+                || arguments != plan.arguments
+                || effect != plan.effect
+            {
+                return Err(EffectLedgerError::PlanMismatch(plan.execution_key.clone()));
+            }
+            let before = recorded
+                .approval_json
+                .as_deref()
+                .map(serde_json::from_str::<ApprovalRecord>)
+                .transpose()
+                .map_err(|error| EffectLedgerError::Invalid(error.to_string()))?;
+            match (before, &plan.approval) {
+                (None, None) => {}
+                (Some(before), Some(after)) if before.pending() => {
+                    if after.pending()
+                        || !matches!(after.decision.as_str(), "allow" | "deny")
+                        || before.required != after.required
+                        || before.principal != after.principal
+                    {
+                        return Err(EffectLedgerError::PlanMismatch(plan.execution_key.clone()));
+                    }
+                    pending_updates.push((
+                        plan.execution_key.clone(),
+                        serde_json::to_string(after).map_err(ledger_storage_error)?,
+                    ));
+                }
+                (Some(before), Some(after)) if &before == after => {}
+                _ => return Err(EffectLedgerError::PlanMismatch(plan.execution_key.clone())),
+            }
+        }
+        for (execution_key, approval_json) in pending_updates {
+            let updated = transaction
+                .execute(
+                    "UPDATE tool_effects SET approval_json = ?1
+                     WHERE execution_key = ?2 AND status = 'planned'",
+                    params![approval_json, execution_key],
+                )
+                .map_err(ledger_storage_error)?;
+            if updated != 1 {
+                return Err(EffectLedgerError::AlreadyTerminal(execution_key));
             }
         }
         transaction.commit().map_err(ledger_storage_error)
@@ -933,14 +1028,23 @@ struct RawPendingEffect {
     approval_json: Option<String>,
 }
 
+struct RawApprovalPlan {
+    status: String,
+    call_id: String,
+    name: String,
+    arguments_json: String,
+    effect_json: String,
+    approval_json: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::BTreeMap, fs};
 
     use domain::{
-        EngineId, LineageId, ManifestDigest, OwnerGeneration, PlannedToolCall, PromptManifest,
-        SemanticMessage, SessionId, ToolArguments, ToolCallId, ToolEffect, ToolResultStatus,
-        ToolTerminal,
+        ApprovalRecord, EngineId, LineageId, ManifestDigest, OwnerGeneration, PlannedToolCall,
+        PromptManifest, SemanticMessage, SessionId, ToolArguments, ToolCallId, ToolEffect,
+        ToolResultStatus, ToolTerminal,
     };
     use ports::{EffectLedger, EffectLedgerError, SessionStore, SessionStoreError};
     use protocol::{SessionConfig, TransportKind};
@@ -1007,6 +1111,35 @@ mod tests {
             effect: plan.effect,
             receipt: None,
         }
+    }
+
+    #[test]
+    fn pending_approval_resolves_durably_before_terminal_dispatch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let database = root.path().join("state.db");
+        let mut ledger = SqliteEffectLedger::open(&database)?;
+        let mut pending = plan("approval:call-terminal")?;
+        pending.name = "terminal".into();
+        pending.effect = ToolEffect::ProcessControl;
+        pending.approval = Some(ApprovalRecord {
+            required: true,
+            decision: "pending".into(),
+            principal: "gateway_user".into(),
+        });
+        ledger.record_plans("approval", &[pending.clone()])?;
+        assert!(ledger.pending()?[0].plan.approval.as_ref().is_some_and(ApprovalRecord::pending));
+
+        let mut resolved = pending.clone();
+        resolved.approval.as_mut().ok_or("approval missing")?.decision = "allow".into();
+        ledger.record_approvals(&[resolved.clone()])?;
+        assert_eq!(
+            ledger.pending()?[0].plan.approval.as_ref().map(|approval| approval.decision.as_str()),
+            Some("allow")
+        );
+        ledger.record_terminals(&[terminal(&resolved)])?;
+        assert!(ledger.pending()?.is_empty());
+        Ok(())
     }
 
     #[test]

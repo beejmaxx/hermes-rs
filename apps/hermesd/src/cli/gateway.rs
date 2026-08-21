@@ -28,10 +28,13 @@ use tokio::{io::AsyncBufReadExt, sync::oneshot, task::JoinHandle};
 
 use super::{
     background::{BackgroundControl, BackgroundSupervisor},
-    chat::{LiveSettings, RuntimeArgs, completed_response, execute_turn_observed},
+    chat::{LiveSettings, ObservedTurn, RuntimeArgs, completed_response, execute_turn_observed},
     state::state_path,
 };
-use crate::adapters::{SqliteDelegationStore, SqliteForegroundTurnStore, SqliteSessionStore};
+use crate::adapters::{
+    ApprovalControl, ApprovalControlError, SqliteDelegationStore, SqliteForegroundTurnStore,
+    SqliteSessionStore,
+};
 
 const RESTART_RECONCILIATION_REASON: &str =
     "owning gateway exited before recording a foreground turn terminal";
@@ -77,6 +80,7 @@ pub async fn run_gateway(
     ))?;
     let background = BackgroundSupervisor::spawn(state.clone());
     let background_control = background.control();
+    let approval_control = ApprovalControl::default();
 
     let mut host = GatewayHost {
         settings,
@@ -85,6 +89,7 @@ pub async fn run_gateway(
         busy: Arc::new(Mutex::new(HashSet::new())),
         controls: Arc::new(Mutex::new(HashMap::new())),
         background_control,
+        approval_control,
         turns: Vec::new(),
     };
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
@@ -106,6 +111,12 @@ pub async fn run_gateway(
         host.dispatch(request).await?;
         host.turns.retain(|turn| !turn.is_finished());
     }
+    if let Ok(mut controls) = host.controls.lock() {
+        for (_, sender) in controls.drain() {
+            let _ = sender.send(());
+        }
+    }
+    host.approval_control.deny_all();
     for turn in host.turns {
         let _ = turn.await;
     }
@@ -120,6 +131,7 @@ struct GatewayHost {
     busy: Arc<Mutex<HashSet<String>>>,
     controls: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     background_control: BackgroundControl,
+    approval_control: ApprovalControl,
     turns: Vec<JoinHandle<()>>,
 }
 
@@ -216,6 +228,7 @@ impl GatewayHost {
             "delegation.list" => self.list_delegations(params),
             "delegation.status" => self.delegation_status(params),
             "delegation.cancel" => self.cancel_delegation(params),
+            "approval.respond" => self.respond_approval(params),
             "input.detect_drop" => {
                 let _ = session_param(params)?;
                 Ok(json!({"matched": false}))
@@ -489,7 +502,22 @@ impl GatewayHost {
         if let Some(sender) = sender {
             let _ = sender.send(());
         }
+        self.approval_control.deny_session(&sid);
         Ok(json!({"ok": true, "status": "interrupted"}))
+    }
+
+    fn respond_approval(&self, params: &Map<String, Value>) -> Result<Value, RpcError> {
+        let session_id = self.authorized_parent(params)?;
+        let choice = params
+            .get("choice")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::new(-32602, "approval choice is required"))?;
+        let resolved =
+            self.approval_control.respond(&session_id, choice).map_err(|error| match error {
+                ApprovalControlError::InvalidChoice(_) => RpcError::new(-32602, error.to_string()),
+                other => internal_error(other),
+            })?;
+        Ok(json!({"resolved": resolved}))
     }
 
     async fn submit(&mut self, id: Value, params: &Map<String, Value>) -> anyhow::Result<()> {
@@ -614,11 +642,13 @@ impl GatewayHost {
         let writer = self.writer.clone();
         let busy = Arc::clone(&self.busy);
         let controls = Arc::clone(&self.controls);
+        let approval_control = self.approval_control.clone();
         self.turns.push(tokio::spawn(async move {
             writer.event("message.start", &sid, None);
             let result = tokio::select! {
-                result = run_session_turn(&state, &writer, &claim) => Some(result),
+                biased;
                 _ = cancel_receiver => None,
+                result = run_session_turn(&state, &writer, &claim, &approval_control) => Some(result),
             };
             let result = match result {
                 Some(Ok(final_response)) => Ok(TurnExit::Completed(final_response)),
@@ -781,6 +811,7 @@ async fn run_session_turn(
     state: &Path,
     writer: &FrameWriter,
     claim: &ForegroundTurnSnapshot,
+    approval_control: &ApprovalControl,
 ) -> anyhow::Result<String> {
     let session_id = &claim.spec.session_id;
     let expected_generation = claim.owner_generation;
@@ -808,7 +839,7 @@ async fn run_session_turn(
         &scope,
         state,
         Some(session_id),
-        &mut observer,
+        ObservedTurn::new(&mut observer, approval_control),
     )
     .await?;
     let final_response = completed_response(&outcome)?.to_owned();
@@ -860,6 +891,7 @@ fn session_info(settings: &LiveSettings) -> Value {
         "tools": {
             "workspace": ["read_file", "search_files"],
             "delegation": ["delegate_task"],
+            "terminal": ["terminal"],
         },
         "usage": zero_usage(settings.model()),
         "version": env!("CARGO_PKG_VERSION"),
@@ -909,6 +941,20 @@ fn emit_runtime_event(
                 "tool_id": event.get("call_id"),
                 "name": event.get("name"),
                 "summary": event.get("status"),
+            })),
+        ),
+        "approval.request" => writer.try_event(
+            kind,
+            session_id,
+            Some(json!({
+                "allow_permanent": false,
+                "choices": ["once", "deny"],
+                "command": event
+                    .get("arguments")
+                    .and_then(|arguments| arguments.get("command"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+                "description": "terminal command requires approval",
             })),
         ),
         _ => Ok(()),

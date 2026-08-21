@@ -85,6 +85,16 @@ pub trait ToolBroker: Send {
     /// Attach effect, approval, and execution-key policy to model calls.
     fn plan(&mut self, calls: &[ToolCall]) -> Result<Vec<PlannedToolCall>, ToolBrokerError>;
 
+    /// Resolve any pending approvals before effect dispatch.
+    ///
+    /// Brokers without asynchronous gates return the plans unchanged.
+    fn resolve_approvals<'a>(
+        &'a mut self,
+        calls: &'a [PlannedToolCall],
+    ) -> BoxFuture<'a, Result<Vec<PlannedToolCall>, ToolBrokerError>> {
+        Box::pin(async move { Ok(calls.to_vec()) })
+    }
+
     /// Execute a batch and return terminals in actual completion order.
     fn execute<'a>(
         &'a mut self,
@@ -454,6 +464,12 @@ pub trait EffectLedger: Send {
         &mut self,
         execution_scope: &str,
         plans: &[PlannedToolCall],
+    ) -> Result<(), EffectLedgerError>;
+
+    /// Atomically replace pending approval requirements with final decisions.
+    fn record_approvals(
+        &mut self,
+        resolved_plans: &[PlannedToolCall],
     ) -> Result<(), EffectLedgerError>;
 
     /// Atomically attach exactly one terminal disposition to every completed plan.

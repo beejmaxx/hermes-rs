@@ -31,6 +31,9 @@
 - Parent-scoped background list/status/cancel controls with durable cancellation
   intent, cooperative in-flight abort, cancellation-safe restart reconciliation,
   and a real provider-in-flight process proof
+- Gateway-only terminal execution with Ink-compatible per-call approval,
+  durable pending/final decisions before dispatch, bounded output/time, Unix
+  process-group cleanup, and real allow/deny/interrupt process proofs
 
 ## Current package decisions
 
