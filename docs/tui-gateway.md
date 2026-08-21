@@ -67,6 +67,20 @@ committed transcript, display-only recovery rows, and structured `recovery`
 metadata containing `auto_replayed: false`. See
 [foreground-turns.md](foreground-turns.md).
 
+New gateway sessions also expose the durable form of `delegate_task`. The
+parent receives a handle immediately while the gateway supervisor claims,
+heartbeats, and runs the immutable child session. A successful child turn and
+its completion outbox commit atomically. The next explicit `prompt.submit` for
+that exact parent claims available completions and atomically captures their
+event IDs and payloads in the foreground provider prompt while acknowledging
+delivery. This is a legal user-role boundary: no synthetic message is injected
+mid-loop and no cached prefix is rewritten.
+
+On forced process death, the replacement gateway uses its exclusive process
+lease to reconcile abandoned children to `outcome_unknown`; it never
+automatically repeats their provider calls. The process-level tests cover both
+normal completion delivery and this kill/restart path.
+
 The child-process integration test drives this entire path through real stdio,
 a local mocked OpenAI-compatible streaming endpoint, the actual runtime, and a
 real SQLite database. It then resumes the session and checks the reconstructed
@@ -131,6 +145,8 @@ This is a usable vertical slice, not a claim of full gateway parity:
   Python delays that row until the first prompt.
 - Steer/queue, approvals, image attachment, shell/slash execution,
   configuration mutation, and desktop/WebSocket methods are not implemented.
+- Background-child cancellation, steering, nested delegation, and replay of an
+  ambiguous child outcome are not implemented.
 
 Unsupported methods return JSON-RPC `-32601`; the gateway does not silently
 pretend that a capability exists. These gaps define follow-up behavior slices

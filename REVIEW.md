@@ -25,6 +25,9 @@
 - Generation-guarded foreground claims, atomic session/turn completion, and a
   real process-death restart proof that reconciles to `outcome_unknown` without
   replay
+- Durable gateway delegation with atomic child/spec acceptance, leased and
+  fenced workers, heartbeats, atomic child/outbox completion, exactly-once
+  next-turn delivery, and real normal/crash process proofs
 
 ## Current package decisions
 
@@ -46,8 +49,6 @@
 ## Deferred
 
 - Reconciliation policy for effects left pending by a crash
-- Long-lived child execution and legal new-turn delivery over the durable
-  delegation state machine
 - Steering and an explicitly proven replay-safe restart policy
 - Branching a new lineage when a user intentionally changes model or manifest
 - A polished `hermes --tui` launcher/config path for Rust (the companion Ink

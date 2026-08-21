@@ -69,8 +69,11 @@ pub struct ToolResult {
 pub enum SemanticMessage {
     /// User input at a legal turn boundary.
     User {
-        /// User-visible content.
+        /// Exact user-role content projected to the provider.
         content: String,
+        /// Human-authored text when durable context was prepended to `content`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_content: Option<String>,
     },
     /// Assistant request for one or more tools.
     AssistantToolRequest {
@@ -292,7 +295,7 @@ mod tests {
     #[test]
     fn accepts_parallel_calls_when_results_keep_call_order() {
         let messages = vec![
-            SemanticMessage::User { content: "compare".into() },
+            SemanticMessage::User { content: "compare".into(), display_content: None },
             SemanticMessage::AssistantToolRequest {
                 content: None,
                 calls: vec![call("a"), call("b")],
@@ -313,7 +316,7 @@ mod tests {
     #[test]
     fn rejects_results_in_completion_order_when_call_order_differs() {
         let messages = vec![
-            SemanticMessage::User { content: "compare".into() },
+            SemanticMessage::User { content: "compare".into(), display_content: None },
             SemanticMessage::AssistantToolRequest {
                 content: None,
                 calls: vec![call("a"), call("b")],
@@ -331,13 +334,19 @@ mod tests {
 
     #[test]
     fn permits_a_user_tail_after_an_interrupted_turn() {
-        assert!(Conversation::new(vec![SemanticMessage::User { content: "hello".into() }]).is_ok());
+        assert!(
+            Conversation::new(vec![SemanticMessage::User {
+                content: "hello".into(),
+                display_content: None,
+            }])
+            .is_ok()
+        );
     }
 
     #[test]
     fn rejects_unresolved_tool_calls() {
         let messages = vec![
-            SemanticMessage::User { content: "read".into() },
+            SemanticMessage::User { content: "read".into(), display_content: None },
             SemanticMessage::AssistantToolRequest {
                 content: None,
                 calls: vec![call("a")],

@@ -601,7 +601,7 @@ pub fn project_conversation(
     let mut projected = Vec::new();
     for message in messages {
         match message {
-            SemanticMessage::User { content } => {
+            SemanticMessage::User { content, .. } => {
                 projected.push(ProviderMessage::User { content: content.clone() });
             }
             SemanticMessage::Assistant { content, reasoning, provider_replay } => {
@@ -829,7 +829,10 @@ fn semanticize(messages: &[ProviderMessage]) -> Result<Vec<SemanticMessage>, Run
         match &messages[index] {
             ProviderMessage::System { .. } => index += 1,
             ProviderMessage::User { content } => {
-                semantic.push(SemanticMessage::User { content: content.clone() });
+                semantic.push(SemanticMessage::User {
+                    content: content.clone(),
+                    display_content: None,
+                });
                 index += 1;
             }
             ProviderMessage::Assistant { content, reasoning, tool_calls, provider_replay }
@@ -935,7 +938,7 @@ mod tests {
     fn semantic_projection_round_trips_a_tool_turn() -> Result<(), Box<dyn std::error::Error>> {
         let call_id = ToolCallId::new("call-read")?;
         let messages = vec![
-            SemanticMessage::User { content: "read it".into() },
+            SemanticMessage::User { content: "read it".into(), display_content: None },
             SemanticMessage::AssistantToolRequest {
                 content: None,
                 calls: vec![ToolCall {

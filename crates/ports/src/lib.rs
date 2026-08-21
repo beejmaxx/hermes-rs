@@ -3,9 +3,10 @@
 use std::pin::Pin;
 
 use domain::{
-    CompletionEventId, DelegationId, DelegationSpec, DelegationTerminal, DelegationWorkerId,
-    DeliveryClaimId, FencingToken, ForegroundTurnId, ForegroundTurnSpec, ForegroundTurnTerminal,
-    OwnerGeneration, PlannedToolCall, SemanticMessage, SessionId, ToolCall, ToolTerminal,
+    CompletionEventId, DelegationAuthority, DelegationId, DelegationSpec, DelegationTerminal,
+    DelegationWorkerId, DeliveryClaimId, FencingToken, ForegroundTurnId, ForegroundTurnSpec,
+    ForegroundTurnTerminal, OwnerGeneration, PlannedToolCall, SemanticMessage, SessionId, ToolCall,
+    ToolTerminal,
 };
 use futures_core::Stream;
 use futures_util::future::BoxFuture;
@@ -185,7 +186,19 @@ pub trait ForegroundTurnStore: Send {
     fn start(
         &mut self,
         spec: ForegroundTurnSpec,
+        provider_prompt: &str,
         expected_generation: OwnerGeneration,
+        started_at_ms: u64,
+    ) -> Result<ForegroundTurnSnapshot, ForegroundTurnStoreError>;
+
+    /// Claim a session generation and atomically acknowledge completion claims
+    /// captured in the exact provider prompt.
+    fn start_with_deliveries(
+        &mut self,
+        spec: ForegroundTurnSpec,
+        provider_prompt: &str,
+        expected_generation: OwnerGeneration,
+        delivery_claims: &[(CompletionEventId, DeliveryClaimId)],
         started_at_ms: u64,
     ) -> Result<ForegroundTurnSnapshot, ForegroundTurnStoreError>;
 
@@ -279,6 +292,14 @@ pub trait DelegationStore: Send {
         now_ms: u64,
     ) -> Result<DelegationSnapshot, DelegationStoreError>;
 
+    /// Atomically create the immutable child lineage and accept its background unit.
+    fn create_with_child(
+        &mut self,
+        child_config: SessionConfig,
+        spec: DelegationSpec,
+        now_ms: u64,
+    ) -> Result<DelegationSnapshot, DelegationStoreError>;
+
     /// Load one complete durable run.
     fn load(
         &mut self,
@@ -318,15 +339,42 @@ pub trait DelegationStore: Send {
         completed_at_ms: u64,
     ) -> Result<DelegationCompletion, DelegationStoreError>;
 
+    /// Atomically append a successful child turn, terminalize its fenced run,
+    /// and enqueue the one completion event.
+    fn complete_child(
+        &mut self,
+        delegation_id: &DelegationId,
+        authority: DelegationAuthority,
+        child_generation: OwnerGeneration,
+        child_messages: &[SemanticMessage],
+        summary: String,
+        completed_at_ms: u64,
+    ) -> Result<DelegationCompletion, DelegationStoreError>;
+
     /// Mark every expired running owner as outcome-unknown and enqueue completions.
     fn reconcile_expired(
         &mut self,
         now_ms: u64,
     ) -> Result<Vec<DelegationCompletion>, DelegationStoreError>;
 
+    /// Conservatively terminalize every running owner abandoned by a replaced host.
+    fn reconcile_running(
+        &mut self,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<Vec<DelegationCompletion>, DelegationStoreError>;
+
     /// List completion events whose delivery claim is absent or expired.
     fn available_completions(
         &mut self,
+        now_ms: u64,
+        limit: usize,
+    ) -> Result<Vec<DelegationCompletion>, DelegationStoreError>;
+
+    /// List deliverable completions routed to one exact parent session.
+    fn available_completions_for(
+        &mut self,
+        parent_session_id: &SessionId,
         now_ms: u64,
         limit: usize,
     ) -> Result<Vec<DelegationCompletion>, DelegationStoreError>;

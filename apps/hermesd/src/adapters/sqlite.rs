@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// SQLite-backed single-writer durable session repository.
 pub struct SqliteSessionStore {
@@ -147,7 +147,7 @@ impl SqliteSessionStore {
                     )
                     .map_err(storage_error)?;
             }
-            2 | 3 | SCHEMA_VERSION => {}
+            2 | 3 | 4 | SCHEMA_VERSION => {}
             other => {
                 return Err(SessionStoreError::Storage(format!(
                     "unsupported SQLite schema version {other}; expected {SCHEMA_VERSION}"
@@ -255,6 +255,18 @@ impl SqliteSessionStore {
                      CREATE INDEX latest_foreground_turn
                          ON foreground_turns(session_id, started_at_ms DESC, turn_id DESC);
                      PRAGMA user_version = 4;
+                     COMMIT;",
+                )
+                .map_err(storage_error)?;
+        }
+        if version <= 4 {
+            connection
+                .execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE foreground_turns
+                         ADD COLUMN provider_prompt TEXT NOT NULL DEFAULT '';
+                     UPDATE foreground_turns SET provider_prompt = prompt;
+                     PRAGMA user_version = 5;
                      COMMIT;",
                 )
                 .map_err(storage_error)?;
@@ -470,57 +482,13 @@ impl EffectLedger for SqliteEffectLedger {
 
 impl SessionStore for SqliteSessionStore {
     fn create(&mut self, config: SessionConfig) -> Result<SessionSnapshot, SessionStoreError> {
-        validate_config(&config)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(storage_error)?;
-        let exists = transaction
-            .query_row(
-                "SELECT 1 FROM sessions WHERE session_id = ?1",
-                params![config.session_id.as_str()],
-                |row| row.get::<_, u8>(0),
-            )
-            .optional()
-            .map_err(storage_error)?
-            .is_some();
-        if exists {
-            return Err(SessionStoreError::AlreadyExists(config.session_id));
-        }
-        let generation = OwnerGeneration::new(1)
-            .map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
-        let tools_json = serde_json::to_string(&config.tools).map_err(storage_error)?;
-        let transport_json = serde_json::to_string(&config.transport).map_err(storage_error)?;
-        transaction
-            .execute(
-                "INSERT INTO sessions (
-                    session_id, lineage_id, owner_generation, engine_id, prompt_revision,
-                    system_prompt_digest, tool_catalog_digest, transport_json, provider_adapter,
-                    base_url, api_key_env, model, tool_root, system_prompt, tools_json
-                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
-                 )",
-                params![
-                    config.session_id.as_str(),
-                    config.lineage_id.as_str(),
-                    to_i64(generation.get(), "owner generation")?,
-                    config.prompt_manifest.engine().as_str(),
-                    to_i64(config.prompt_manifest.revision(), "prompt revision")?,
-                    config.prompt_manifest.system_prompt().as_str(),
-                    config.prompt_manifest.tool_catalog().as_str(),
-                    transport_json,
-                    config.provider_adapter,
-                    config.base_url,
-                    config.api_key_env,
-                    config.model,
-                    config.tool_root,
-                    config.system_prompt,
-                    tools_json,
-                ],
-            )
-            .map_err(storage_error)?;
+        let snapshot = create_session_in_transaction(&transaction, config)?;
         transaction.commit().map_err(storage_error)?;
-        Ok(SessionSnapshot { config, owner_generation: generation, conversation: Vec::new() })
+        Ok(snapshot)
     }
 
     fn load(&mut self, session_id: &SessionId) -> Result<SessionSnapshot, SessionStoreError> {
@@ -575,6 +543,58 @@ impl SessionStore for SqliteSessionStore {
         })
         .collect()
     }
+}
+
+pub(super) fn create_session_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    config: SessionConfig,
+) -> Result<SessionSnapshot, SessionStoreError> {
+    validate_config(&config)?;
+    let exists = transaction
+        .query_row(
+            "SELECT 1 FROM sessions WHERE session_id = ?1",
+            params![config.session_id.as_str()],
+            |row| row.get::<_, u8>(0),
+        )
+        .optional()
+        .map_err(storage_error)?
+        .is_some();
+    if exists {
+        return Err(SessionStoreError::AlreadyExists(config.session_id));
+    }
+    let generation =
+        OwnerGeneration::new(1).map_err(|error| SessionStoreError::Invalid(error.to_string()))?;
+    let tools_json = serde_json::to_string(&config.tools).map_err(storage_error)?;
+    let transport_json = serde_json::to_string(&config.transport).map_err(storage_error)?;
+    transaction
+        .execute(
+            "INSERT INTO sessions (
+                    session_id, lineage_id, owner_generation, engine_id, prompt_revision,
+                    system_prompt_digest, tool_catalog_digest, transport_json, provider_adapter,
+                    base_url, api_key_env, model, tool_root, system_prompt, tools_json
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+                 )",
+            params![
+                config.session_id.as_str(),
+                config.lineage_id.as_str(),
+                to_i64(generation.get(), "owner generation")?,
+                config.prompt_manifest.engine().as_str(),
+                to_i64(config.prompt_manifest.revision(), "prompt revision")?,
+                config.prompt_manifest.system_prompt().as_str(),
+                config.prompt_manifest.tool_catalog().as_str(),
+                transport_json,
+                config.provider_adapter,
+                config.base_url,
+                config.api_key_env,
+                config.model,
+                config.tool_root,
+                config.system_prompt,
+                tools_json,
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(SessionSnapshot { config, owner_generation: generation, conversation: Vec::new() })
 }
 
 pub(super) fn append_turn_in_transaction(
@@ -946,7 +966,7 @@ mod tests {
 
     fn turn(user: &str, assistant: &str) -> Vec<SemanticMessage> {
         vec![
-            SemanticMessage::User { content: user.into() },
+            SemanticMessage::User { content: user.into(), display_content: None },
             SemanticMessage::Assistant {
                 content: assistant.into(),
                 reasoning: None,

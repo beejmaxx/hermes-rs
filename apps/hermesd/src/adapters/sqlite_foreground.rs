@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use domain::{
-    ForegroundTurnId, ForegroundTurnSpec, ForegroundTurnState, ForegroundTurnTerminal,
-    OwnerGeneration, SemanticMessage, SessionId,
+    CompletionEventId, DeliveryClaimId, ForegroundTurnId, ForegroundTurnSpec, ForegroundTurnState,
+    ForegroundTurnTerminal, OwnerGeneration, SemanticMessage, SessionId,
 };
 use ports::{ForegroundTurnStore, ForegroundTurnStoreError, SessionStoreError};
 use protocol::{ForegroundTurnSnapshot, SessionSnapshot};
@@ -35,10 +35,23 @@ impl ForegroundTurnStore for SqliteForegroundTurnStore {
     fn start(
         &mut self,
         spec: ForegroundTurnSpec,
+        provider_prompt: &str,
         expected_generation: OwnerGeneration,
         started_at_ms: u64,
     ) -> Result<ForegroundTurnSnapshot, ForegroundTurnStoreError> {
+        self.start_with_deliveries(spec, provider_prompt, expected_generation, &[], started_at_ms)
+    }
+
+    fn start_with_deliveries(
+        &mut self,
+        spec: ForegroundTurnSpec,
+        provider_prompt: &str,
+        expected_generation: OwnerGeneration,
+        delivery_claims: &[(CompletionEventId, DeliveryClaimId)],
+        started_at_ms: u64,
+    ) -> Result<ForegroundTurnSnapshot, ForegroundTurnStoreError> {
         validate_spec(&spec)?;
+        validate_provider_prompt(provider_prompt)?;
         let started_at = to_i64(started_at_ms, "start timestamp")?;
         let transaction = self
             .connection
@@ -74,21 +87,48 @@ impl ForegroundTurnStore for SqliteForegroundTurnStore {
         transaction
             .execute(
                 "INSERT INTO foreground_turns (
-                    turn_id, session_id, owner_generation, prompt, state,
+                    turn_id, session_id, owner_generation, prompt, provider_prompt, state,
                     started_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?5)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?6)",
                 params![
                     spec.turn_id.as_str(),
                     spec.session_id.as_str(),
                     to_i64(expected_generation.get(), "owner generation")?,
                     spec.prompt,
+                    provider_prompt,
                     started_at,
                 ],
             )
             .map_err(storage_error)?;
+        for (event_id, claim_id) in delivery_claims {
+            let delivered = transaction
+                .execute(
+                    "UPDATE delegation_completions
+                     SET delivery_state = 'delivered', delivered_at_ms = ?1,
+                         delivery_claim_id = NULL, delivery_claim_expires_at_ms = NULL
+                     WHERE event_id = ?2 AND delivery_state = 'pending'
+                       AND delivery_claim_id = ?3 AND created_at_ms <= ?1
+                       AND delegation_id IN (
+                           SELECT delegation_id FROM delegations WHERE parent_session_id = ?4
+                       )",
+                    params![
+                        started_at,
+                        event_id.as_str(),
+                        claim_id.as_str(),
+                        spec.session_id.as_str(),
+                    ],
+                )
+                .map_err(storage_error)?;
+            if delivered != 1 {
+                return Err(ForegroundTurnStoreError::Invalid(format!(
+                    "completion delivery claim is no longer owned: {event_id}"
+                )));
+            }
+        }
         transaction.commit().map_err(storage_error)?;
         Ok(ForegroundTurnSnapshot {
             spec,
+            provider_prompt: provider_prompt.to_owned(),
             owner_generation: expected_generation,
             state: ForegroundTurnState::Running,
             started_at_ms,
@@ -273,6 +313,7 @@ struct RawForegroundTurn {
     session_id: String,
     owner_generation: i64,
     prompt: String,
+    provider_prompt: String,
     state: String,
     terminal_json: Option<String>,
     started_at_ms: i64,
@@ -285,8 +326,8 @@ fn load_raw(
 ) -> Result<RawForegroundTurn, ForegroundTurnStoreError> {
     connection
         .query_row(
-            "SELECT turn_id, session_id, owner_generation, prompt, state, terminal_json,
-                    started_at_ms, updated_at_ms
+            "SELECT turn_id, session_id, owner_generation, prompt, provider_prompt, state,
+                    terminal_json, started_at_ms, updated_at_ms
              FROM foreground_turns WHERE turn_id = ?1",
             params![turn_id.as_str()],
             |row| {
@@ -295,10 +336,11 @@ fn load_raw(
                     session_id: row.get(1)?,
                     owner_generation: row.get(2)?,
                     prompt: row.get(3)?,
-                    state: row.get(4)?,
-                    terminal_json: row.get(5)?,
-                    started_at_ms: row.get(6)?,
-                    updated_at_ms: row.get(7)?,
+                    provider_prompt: row.get(4)?,
+                    state: row.get(5)?,
+                    terminal_json: row.get(6)?,
+                    started_at_ms: row.get(7)?,
+                    updated_at_ms: row.get(8)?,
                 })
             },
         )
@@ -310,6 +352,7 @@ fn load_raw(
 fn snapshot_from_raw(
     raw: RawForegroundTurn,
 ) -> Result<ForegroundTurnSnapshot, ForegroundTurnStoreError> {
+    validate_provider_prompt(&raw.provider_prompt)?;
     let turn_id = ForegroundTurnId::new(raw.turn_id)
         .map_err(|error| ForegroundTurnStoreError::Invalid(error.to_string()))?;
     let state = if raw.state == "running" {
@@ -346,6 +389,7 @@ fn snapshot_from_raw(
                 .map_err(|error| ForegroundTurnStoreError::Invalid(error.to_string()))?,
             prompt: raw.prompt,
         },
+        provider_prompt: raw.provider_prompt,
         owner_generation: generation(raw.owner_generation)?,
         state,
         started_at_ms: u64_from_i64(raw.started_at_ms, "start timestamp")?,
@@ -356,6 +400,15 @@ fn snapshot_from_raw(
 fn validate_spec(spec: &ForegroundTurnSpec) -> Result<(), ForegroundTurnStoreError> {
     if spec.prompt.trim().is_empty() {
         return Err(ForegroundTurnStoreError::Invalid("prompt must be non-empty".into()));
+    }
+    Ok(())
+}
+
+fn validate_provider_prompt(prompt: &str) -> Result<(), ForegroundTurnStoreError> {
+    if prompt.trim().is_empty() {
+        return Err(ForegroundTurnStoreError::Invalid(
+            "foreground provider prompt must be non-empty".into(),
+        ));
     }
     Ok(())
 }
@@ -476,24 +529,27 @@ mod tests {
     use std::fs;
 
     use domain::{
-        EngineId, ForegroundTurnId, ForegroundTurnSpec, ForegroundTurnState,
+        CompletionEventId, DelegationId, DelegationSpec, DelegationTerminal, DelegationWorkerId,
+        DeliveryClaimId, EngineId, ForegroundTurnId, ForegroundTurnSpec, ForegroundTurnState,
         ForegroundTurnTerminal, LineageId, ManifestDigest, PromptManifest, SemanticMessage,
         SessionId,
     };
-    use ports::{ForegroundTurnStore, ForegroundTurnStoreError, SessionStore};
+    use ports::{DelegationStore, ForegroundTurnStore, ForegroundTurnStoreError, SessionStore};
     use protocol::{SessionConfig, TransportKind};
     use serde_json::json;
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use super::{SqliteForegroundTurnStore, SqliteSessionStore};
+    use crate::adapters::SqliteDelegationStore;
 
     #[test]
     fn completion_atomically_advances_session_and_terminalizes_claim()
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new("complete")?;
         let mut turns = SqliteForegroundTurnStore::open(&fixture.database)?;
-        let started = turns.start(fixture.spec("turn-one", "hello")?, fixture.generation, 10)?;
+        let started =
+            turns.start(fixture.spec("turn-one", "hello")?, "hello", fixture.generation, 10)?;
         assert_eq!(started.state, ForegroundTurnState::Running);
 
         let committed =
@@ -516,11 +572,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new("rollback")?;
         let mut turns = SqliteForegroundTurnStore::open(&fixture.database)?;
-        let started = turns.start(fixture.spec("turn-bad", "hello")?, fixture.generation, 10)?;
+        let started =
+            turns.start(fixture.spec("turn-bad", "hello")?, "hello", fixture.generation, 10)?;
         let error = turns.complete(
             &started.spec.turn_id,
             fixture.generation,
-            &[SemanticMessage::User { content: "hello".into() }],
+            &[SemanticMessage::User { content: "hello".into(), display_content: None }],
             20,
         );
         assert!(matches!(error, Err(ForegroundTurnStoreError::Invalid(_))));
@@ -541,14 +598,16 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new("interrupt")?;
         let mut turns = SqliteForegroundTurnStore::open(&fixture.database)?;
-        let first = turns.start(fixture.spec("turn-first", "one")?, fixture.generation, 10)?;
+        let first =
+            turns.start(fixture.spec("turn-first", "one")?, "one", fixture.generation, 10)?;
         turns.terminate(
             &first.spec.turn_id,
             fixture.generation,
             ForegroundTurnTerminal::Interrupted { reason: "client requested stop".into() },
             20,
         )?;
-        let second = turns.start(fixture.spec("turn-second", "two")?, fixture.generation, 30)?;
+        let second =
+            turns.start(fixture.spec("turn-second", "two")?, "two", fixture.generation, 30)?;
         assert_eq!(second.owner_generation, fixture.generation);
         assert_eq!(turns.latest(&fixture.session_id)?, Some(second));
 
@@ -562,7 +621,12 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let fixture = Fixture::new("reconcile")?;
         let mut turns = SqliteForegroundTurnStore::open(&fixture.database)?;
-        turns.start(fixture.spec("turn-lost", "do not replay me")?, fixture.generation, 10)?;
+        turns.start(
+            fixture.spec("turn-lost", "do not replay me")?,
+            "do not replay me",
+            fixture.generation,
+            10,
+        )?;
         let reconciled = turns.reconcile_running("owning gateway restarted", 20)?;
         assert_eq!(reconciled.len(), 1);
         assert_eq!(reconciled[0].spec.prompt, "do not replay me");
@@ -589,14 +653,83 @@ mod tests {
         let mut turns = SqliteForegroundTurnStore::open(&fixture.database)?;
         let stale = domain::OwnerGeneration::new(2)?;
         assert!(matches!(
-            turns.start(fixture.spec("turn-stale", "stale")?, stale, 10),
+            turns.start(fixture.spec("turn-stale", "stale")?, "stale", stale, 10),
             Err(ForegroundTurnStoreError::GenerationConflict { expected: 2, actual: 1, .. })
         ));
-        turns.start(fixture.spec("turn-owner", "owner")?, fixture.generation, 10)?;
+        turns.start(fixture.spec("turn-owner", "owner")?, "owner", fixture.generation, 10)?;
         assert!(matches!(
-            turns.start(fixture.spec("turn-racer", "racer")?, fixture.generation, 11),
+            turns.start(fixture.spec("turn-racer", "racer")?, "racer", fixture.generation, 11,),
             Err(ForegroundTurnStoreError::SessionBusy(_))
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn foreground_acceptance_and_completion_acknowledgement_are_atomic()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = Fixture::new("delivery")?;
+        let child_id = SessionId::new("delivery-child")?;
+        SqliteSessionStore::open(&fixture.database)?
+            .create(config(&child_id, fixture._directory.path())?)?;
+        let delegation_spec = DelegationSpec {
+            delegation_id: DelegationId::new("delivery-delegation")?,
+            completion_event_id: CompletionEventId::new("delivery-event")?,
+            parent_session_id: fixture.session_id.clone(),
+            child_session_id: child_id,
+            goal: "deliver this result".into(),
+            context: None,
+        };
+        let mut delegations = SqliteDelegationStore::open(&fixture.database)?;
+        let pending = delegations.create(delegation_spec.clone(), 10)?;
+        let running = delegations.claim(
+            &delegation_spec.delegation_id,
+            pending.owner_generation,
+            DelegationWorkerId::new("delivery-worker")?,
+            20,
+            100,
+        )?;
+        let fence = match running.state {
+            domain::DelegationState::Running { fencing_token, .. } => fencing_token,
+            other => return Err(format!("expected running delegation, got {other:?}").into()),
+        };
+        let completion = delegations.finish(
+            &delegation_spec.delegation_id,
+            running.owner_generation,
+            fence,
+            DelegationTerminal::Completed { summary: "durable result".into() },
+            30,
+        )?;
+        let claim_id = DeliveryClaimId::new("delivery-claim")?;
+        assert!(
+            delegations
+                .claim_completion(&completion.event_id, claim_id.clone(), 40, 100)?
+                .is_some()
+        );
+
+        let mut turns = SqliteForegroundTurnStore::open(&fixture.database)?;
+        let spec = fixture.spec("turn-delivery", "continue")?;
+        let provider_prompt = "background result: durable result\n\ncontinue";
+        assert!(matches!(
+            turns.start_with_deliveries(
+                spec.clone(),
+                provider_prompt,
+                fixture.generation,
+                &[(completion.event_id.clone(), DeliveryClaimId::new("wrong-claim")?,)],
+                50,
+            ),
+            Err(ForegroundTurnStoreError::Invalid(_))
+        ));
+        assert!(turns.latest(&fixture.session_id)?.is_none());
+
+        let started = turns.start_with_deliveries(
+            spec,
+            provider_prompt,
+            fixture.generation,
+            &[(completion.event_id.clone(), claim_id)],
+            50,
+        )?;
+        assert_eq!(started.provider_prompt, provider_prompt);
+        assert!(delegations.available_completions(101, 10)?.is_empty());
         Ok(())
     }
 
@@ -637,7 +770,7 @@ mod tests {
 
     fn turn(user: &str, assistant: &str) -> Vec<SemanticMessage> {
         vec![
-            SemanticMessage::User { content: user.into() },
+            SemanticMessage::User { content: user.into(), display_content: None },
             SemanticMessage::Assistant {
                 content: assistant.into(),
                 reasoning: None,

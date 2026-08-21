@@ -7,9 +7,12 @@ use std::{
     time::Duration,
 };
 
-use domain::{ForegroundTurnState, ForegroundTurnTerminal};
-use hermesd::adapters::{AgentTools, SqliteForegroundTurnStore, SqliteSessionStore};
-use ports::{ForegroundTurnStore, SessionStore};
+use domain::{DelegationState, DelegationTerminal, ForegroundTurnState, ForegroundTurnTerminal};
+use hermesd::adapters::{
+    AgentTools, ReadOnlyLocalTools, SqliteDelegationStore, SqliteForegroundTurnStore,
+    SqliteSessionStore,
+};
+use ports::{DelegationStore, ForegroundTurnStore, SessionStore};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
@@ -33,7 +36,7 @@ async fn stdio_client_can_create_prompt_and_resume_a_durable_session()
                 {"role": "system", "content": system},
                 {"role": "user", "content": "hello gateway"}
             ],
-            "tools": AgentTools::catalog(),
+            "tools": AgentTools::background_catalog(),
             "stream": true,
             "stream_options": {"include_usage": true}
         })))
@@ -334,6 +337,316 @@ async fn process_death_is_reconciled_without_replaying_the_prompt()
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn background_delegation_runs_and_is_delivered_with_the_next_user_turn()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = tempdir()?;
+    let workspace = tempdir()?;
+    let root = fs::canonicalize(workspace.path())?;
+    let database = state_dir.path().join("state.db");
+    let server = MockServer::start().await;
+    let system = "Use durable background delegation when asked.";
+    let goal = "Inspect the architecture independently.";
+    let child_system = format!(
+        "You are a focused leaf subagent. You cannot delegate, interact with the user, or modify files. Inspect the workspace at {} with read-only tools when useful.\n\nTASK:\n{goal}",
+        root.display()
+    );
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": "start background work"}
+            ],
+            "tools": AgentTools::background_catalog(),
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .respond_with(tool_call("delegate-background", "delegate_task", json!({"goal": goal})))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("Queued background delegation"))
+        .respond_with(streaming_text("The background task is queued."))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": child_system},
+                {
+                    "role": "user",
+                    "content": "Complete the assigned task and return a concise result for the parent agent."
+                }
+            ],
+            "tools": ReadOnlyLocalTools::catalog(),
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .respond_with(streaming_text("The architecture has a typed Rust kernel."))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("<background_completion"))
+        .and(matchers::body_string_contains("what did it find?"))
+        .respond_with(streaming_text("The child found a typed Rust kernel."))
+        .mount(&server)
+        .await;
+
+    let mut gateway = GatewayProcess::spawn(&[
+        "--state",
+        path_text(&database)?,
+        "gateway",
+        "--provider",
+        "custom",
+        "--base-url",
+        &format!("{}/v1", server.uri()),
+        "--model",
+        "test-model",
+        "--root",
+        path_text(&root)?,
+        "--system",
+        system,
+    ])?;
+    let ready = gateway.read_frame()?;
+    assert_eq!(ready["params"]["payload"]["reconciled_delegations"], 0);
+    gateway.request("create", "session.create", json!({}))?;
+    let created = gateway.read_response("create")?;
+    let parent_id = created["result"]["session_id"]
+        .as_str()
+        .ok_or("session.create omitted session_id")?
+        .to_owned();
+
+    gateway.request(
+        "dispatch",
+        "prompt.submit",
+        json!({"session_id": parent_id, "text": "start background work"}),
+    )?;
+    assert_eq!(gateway.read_response("dispatch")?["result"]["delivered_background_completions"], 0);
+    read_until_session_info(&mut gateway, &parent_id)?;
+
+    let parent_session_id = domain::SessionId::new(&parent_id)?;
+    let completion = wait_for_completion(&database, &parent_session_id).await?;
+    assert!(matches!(
+        &completion.outcome,
+        DelegationTerminal::Completed { summary }
+            if summary == "The architecture has a typed Rust kernel."
+    ));
+    let snapshot = SqliteDelegationStore::open(&database)?.load(&completion.delegation_id)?;
+    assert!(matches!(snapshot.state, DelegationState::Terminal { .. }));
+    assert_eq!(
+        SqliteSessionStore::open(&database)?
+            .load(&snapshot.spec.child_session_id)?
+            .conversation
+            .len(),
+        2
+    );
+
+    gateway.request(
+        "delivery",
+        "prompt.submit",
+        json!({"session_id": parent_id, "text": "what did it find?"}),
+    )?;
+    assert_eq!(gateway.read_response("delivery")?["result"]["delivered_background_completions"], 1);
+    read_until_session_info(&mut gateway, &parent_id)?;
+    assert!(
+        SqliteDelegationStore::open(&database)?
+            .available_completions_for(&parent_session_id, i64::MAX as u64, 10)?
+            .is_empty()
+    );
+    let parent = SqliteSessionStore::open(&database)?.load(&parent_session_id)?;
+    assert_eq!(parent.conversation.len(), 6);
+    gateway.request("resume", "session.resume", json!({"session_id": parent_id}))?;
+    let resumed = gateway.read_response("resume")?;
+    assert_eq!(resumed["result"]["messages"][4]["text"], "what did it find?");
+    gateway.shutdown()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn killed_background_worker_reconciles_unknown_without_replay()
+-> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = tempdir()?;
+    let workspace = tempdir()?;
+    let root = fs::canonicalize(workspace.path())?;
+    let database = state_dir.path().join("state.db");
+    let server = MockServer::start().await;
+    let system = "Use background delegation.";
+    let goal = "Perform a slow independent inspection.";
+    let child_system = format!(
+        "You are a focused leaf subagent. You cannot delegate, interact with the user, or modify files. Inspect the workspace at {} with read-only tools when useful.\n\nTASK:\n{goal}",
+        root.display()
+    );
+
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("start slow background work"))
+        .and(matchers::body_string_contains("durable leaf-agent session"))
+        .respond_with(tool_call("delegate-slow", "delegate_task", json!({"goal": goal})))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("Queued background delegation"))
+        .respond_with(streaming_text("The slow task is queued."))
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_json(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": child_system},
+                {
+                    "role": "user",
+                    "content": "Complete the assigned task and return a concise result for the parent agent."
+                }
+            ],
+            "tools": ReadOnlyLocalTools::catalog(),
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        })))
+        .respond_with(
+            streaming_text("This result must not survive the process death.")
+                .set_delay(Duration::from_secs(10)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(matchers::method("POST"))
+        .and(matchers::path("/v1/chat/completions"))
+        .and(matchers::body_string_contains("outcome_unknown"))
+        .and(matchers::body_string_contains("report the recovered state"))
+        .respond_with(streaming_text("The background outcome is unknown and was not replayed."))
+        .mount(&server)
+        .await;
+
+    let base_url = format!("{}/v1", server.uri());
+    let arguments = [
+        "--state",
+        path_text(&database)?,
+        "gateway",
+        "--provider",
+        "custom",
+        "--base-url",
+        &base_url,
+        "--model",
+        "test-model",
+        "--root",
+        path_text(&root)?,
+        "--system",
+        system,
+    ];
+    let mut gateway = GatewayProcess::spawn(&arguments)?;
+    let _ready = gateway.read_frame()?;
+    gateway.request("create", "session.create", json!({}))?;
+    let created = gateway.read_response("create")?;
+    let parent_id = created["result"]["session_id"]
+        .as_str()
+        .ok_or("session.create omitted session_id")?
+        .to_owned();
+    gateway.request(
+        "dispatch",
+        "prompt.submit",
+        json!({"session_id": parent_id, "text": "start slow background work"}),
+    )?;
+    let _accepted = gateway.read_response("dispatch")?;
+    read_until_session_info(&mut gateway, &parent_id)?;
+
+    let mut child_request_started = false;
+    for _ in 0..200 {
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or("request recording is disabled on the mock server")?;
+        if requests.iter().any(|request| {
+            serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| {
+                body["messages"][0]["content"].as_str() == Some(child_system.as_str())
+            })
+        }) {
+            child_request_started = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(child_request_started, "child provider request did not start before process death");
+    gateway.kill()?;
+
+    let mut recovered = GatewayProcess::spawn(&arguments)?;
+    let ready = recovered.read_frame()?;
+    assert_eq!(ready["params"]["payload"]["reconciled_delegations"], 1);
+    let parent_session_id = domain::SessionId::new(&parent_id)?;
+    let completion = wait_for_completion(&database, &parent_session_id).await?;
+    assert!(matches!(
+        &completion.outcome,
+        DelegationTerminal::OutcomeUnknown { reason }
+            if reason.contains("owning gateway exited")
+    ));
+    let delegation = SqliteDelegationStore::open(&database)?.load(&completion.delegation_id)?;
+    assert!(
+        SqliteSessionStore::open(&database)?
+            .load(&delegation.spec.child_session_id)?
+            .conversation
+            .is_empty()
+    );
+
+    recovered.request(
+        "delivery",
+        "prompt.submit",
+        json!({"session_id": parent_id, "text": "report the recovered state"}),
+    )?;
+    assert_eq!(
+        recovered.read_response("delivery")?["result"]["delivered_background_completions"],
+        1
+    );
+    read_until_session_info(&mut recovered, &parent_id)?;
+    assert!(
+        SqliteDelegationStore::open(&database)?
+            .available_completions_for(&parent_session_id, i64::MAX as u64, 10)?
+            .is_empty()
+    );
+    recovered.shutdown()?;
+    Ok(())
+}
+
+fn read_until_session_info(
+    gateway: &mut GatewayProcess,
+    session_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        let frame = gateway.read_frame()?;
+        if frame["method"] == "event"
+            && frame["params"]["session_id"] == session_id
+            && frame["params"]["type"] == "session.info"
+        {
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_for_completion(
+    database: &std::path::Path,
+    parent_session_id: &domain::SessionId,
+) -> Result<protocol::DelegationCompletion, Box<dyn std::error::Error>> {
+    for _ in 0..200 {
+        let available = SqliteDelegationStore::open(database)?.available_completions_for(
+            parent_session_id,
+            i64::MAX as u64,
+            10,
+        )?;
+        if let Some(completion) = available.into_iter().next() {
+            return Ok(completion);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("background completion was not durably enqueued".into())
+}
+
 struct GatewayProcess {
     child: Child,
     input: Option<ChildStdin>,
@@ -423,6 +736,28 @@ fn streaming_text(content: &str) -> ResponseTemplate {
                 "choices": [{
                     "delta": {"role": "assistant", "content": content},
                     "finish_reason": "stop"
+                }]
+            })
+        ),
+    )
+}
+
+fn tool_call(id: &str, name: &str, arguments: Value) -> ResponseTemplate {
+    ResponseTemplate::new(200).insert_header("content-type", "text/event-stream").set_body_string(
+        format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            json!({
+                "choices": [{
+                    "delta": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments.to_string()}
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
                 }]
             })
         ),

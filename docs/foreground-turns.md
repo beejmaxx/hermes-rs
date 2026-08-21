@@ -29,6 +29,15 @@ The prompt is kept outside semantic conversation history until completion.
 That preserves strict role alternation and avoids presenting an unresolved user
 tail to the next provider request.
 
+The claim stores both the visible user prompt and the exact provider prompt.
+They are normally identical. When durable background completions are
+available, the provider prompt prepends their event IDs and typed terminal
+payloads at this legal user-turn boundary. Foreground acceptance and
+acknowledgement of all included completion claims occur in one SQLite
+transaction. The committed semantic user record retains those exact provider
+bytes for replay and separately stores the human-authored display text, so the
+client transcript does not pretend the injected context was typed by the user.
+
 ## Atomic completion
 
 Successful completion performs these writes in one immediate SQLite

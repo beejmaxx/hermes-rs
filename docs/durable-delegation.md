@@ -47,39 +47,49 @@ terminal write supplies both the expected current generation and that fencing
 token. A stale worker can therefore neither extend nor finish a run after
 another authoritative transition.
 
-The first implementation does not reclaim an expired `running` child. Model
-inference may be billable, and later capability sets may include effects whose
-outcome cannot be inferred after a crash. Lease expiry therefore records
-`outcome_unknown`. Only work still in `pending` is automatically safe to start
-after a restart. Replay of a running child will require an explicit policy
+The supervisor never reclaims an expired `running` child. Model inference may
+be billable, and later capability sets may include effects whose outcome cannot
+be inferred after a crash. Lease expiry therefore records `outcome_unknown`.
+The gateway's exclusive OS lease also proves at startup that every owner left
+by the prior process is abandoned, so restart reconciliation does not wait for
+the wall-clock deadline. Only work still in `pending` is automatically safe to
+start after a restart. Replay of a running child requires an explicit policy
 proving its complete frozen capability set is replay-safe.
 
 ## Terminal and delivery atomicity
 
-A worker terminal or lease reconciliation updates the delegation and inserts
-its one `DelegationCompletion` in the same SQLite transaction. A crash can
-leave both absent or both committed, never a terminal child with a lost
-completion.
+A successful worker appends the complete child turn, terminalizes its fenced
+delegation, and inserts its one `DelegationCompletion` in the same SQLite
+transaction. Known failures and reconciliation atomically write the terminal
+and completion. A crash can leave the entire transition absent or committed,
+never a completed child with a lost outbox event.
 
 Completion delivery is a separate leased claim keyed by the immutable event
 ID. Competing CLI, gateway, or daemon consumers may inspect the same outbox,
 but only the current claim holder can acknowledge it. A failed consumer
 releases its claim; an abandoned claim becomes available after its deadline.
 Acknowledgement means a host accepted the event at a legal new-turn boundary,
-not merely that it read the row.
+not merely that it read the row. The gateway renders every claimed completion
+into the next explicit user-role provider prompt. Its foreground transaction
+captures those exact prompt bytes and acknowledges all included event claims
+together, so neither half can commit alone. The system prompt and all prior
+messages remain byte-stable.
 
-## Current integration boundary
+## Gateway integration
 
-The SQLite state machine, fencing, reconciliation, schema migration, and
-completion outbox are implemented. The existing model-facing delegation path
-remains synchronous and leaf-only until a long-lived host can:
+New gateway sessions freeze a background form of `delegate_task`. A call:
 
-- create the dedicated child session and durable spec before returning a
-  dispatch handle;
-- claim and heartbeat the child while it runs;
-- stop heartbeats before committing one terminal; and
-- claim the completion and inject it as one idempotent new turn for the exact
-  parent session.
+- atomically creates a dedicated immutable child session and `pending` spec;
+- returns its deterministic durable handle to the parent immediately;
+- is claimed by the process supervisor under an owner generation, worker ID,
+  fencing token, and renewable lease;
+- runs through the same provider-neutral runtime with only read-only tools;
+- atomically commits the child turn, terminal, and completion outbox; and
+- is delivered exactly once with the next explicit parent prompt.
+
+The ordinary `hermesd chat` command retains its synchronous leaf behavior; its
+frozen tool schema describes that different contract. The gateway never swaps
+either catalog during a lineage.
 
 Steering, cancellation requests, nested orchestrators, and retry of an expired
 running child remain later state transitions. They will extend this concrete

@@ -13,7 +13,7 @@ pub use conversation::{
     Conversation, ConversationError, SemanticMessage, ToolArguments, ToolCall, ToolResult,
     ToolResultStatus,
 };
-pub use delegation::{DelegationSpec, DelegationState, DelegationTerminal};
+pub use delegation::{DelegationAuthority, DelegationSpec, DelegationState, DelegationTerminal};
 pub use effect::{ApprovalRecord, PlannedToolCall, ToolEffect, ToolTerminal};
 pub use foreground::{ForegroundTurnSpec, ForegroundTurnState, ForegroundTurnTerminal};
 pub use id::{

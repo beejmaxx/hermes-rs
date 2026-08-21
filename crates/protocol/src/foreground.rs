@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 pub struct ForegroundTurnSnapshot {
     /// Immutable attempt identity and user input.
     pub spec: ForegroundTurnSpec,
+    /// Exact user-role content submitted to the provider. This can include
+    /// idempotently delivered background completions before the visible prompt.
+    pub provider_prompt: String,
     /// Session authority generation frozen when the attempt was accepted.
     pub owner_generation: OwnerGeneration,
     /// Running or terminal lifecycle state.

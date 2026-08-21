@@ -3,26 +3,32 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use domain::{
-    PlannedToolCall, ToolArguments, ToolCall, ToolEffect, ToolResultStatus, ToolTerminal,
+    CompletionEventId, DelegationId, DelegationSpec, EngineId, LineageId, ManifestDigest,
+    PlannedToolCall, PromptManifest, SessionId, ToolArguments, ToolCall, ToolEffect,
+    ToolResultStatus, ToolTerminal,
 };
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use ports::{ToolBroker, ToolBrokerError};
-use protocol::{AgentTurnRequest, ProviderMessage, TerminalStatus, TransportKind};
+use ports::{DelegationStore, SessionStore, ToolBroker, ToolBrokerError};
+use protocol::{AgentTurnRequest, ProviderMessage, SessionConfig, TerminalStatus, TransportKind};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{
     local_tools::{LocalToolsConfigError, ReadOnlyLocalTools},
     openai::{OpenAiCompatibleProvider, OpenAiProviderConfigError},
-    sqlite::SqliteEffectLedger,
+    sqlite::{SqliteEffectLedger, SqliteSessionStore},
+    sqlite_delegation::SqliteDelegationStore,
 };
 use runtime::JournaledToolBroker;
 
 const DELEGATE_TOOL: &str = "delegate_task";
+const BACKGROUND_DELEGATE_DESCRIPTION: &str = "Queue one focused, independent subtask in a durable leaf-agent session. Return immediately with a task handle. The final result is delivered exactly once with a later explicit user turn; the child cannot delegate or modify files.";
 const MAX_GOAL_CHARS: usize = 16_000;
 const MAX_CONTEXT_CHARS: usize = 32_000;
 const MAX_RESULT_CHARS: usize = 32_000;
@@ -51,6 +57,7 @@ pub struct AgentToolsConfig {
     root: PathBuf,
     state: PathBuf,
     delegation_enabled: bool,
+    background_parent: Option<SessionId>,
 }
 
 impl AgentToolsConfig {
@@ -76,7 +83,15 @@ impl AgentToolsConfig {
             root: root.into(),
             state: state.into(),
             delegation_enabled,
+            background_parent: None,
         })
+    }
+
+    /// Route delegation calls into durable background work for this parent.
+    #[must_use]
+    pub fn with_background_parent(mut self, parent_session_id: SessionId) -> Self {
+        self.background_parent = Some(parent_session_id);
+        self
     }
 }
 
@@ -128,6 +143,37 @@ impl AgentTools {
             }
         }));
         tools
+    }
+
+    /// Ordered tool schemas for a long-lived host with durable completion delivery.
+    #[must_use]
+    pub fn background_catalog() -> Vec<Value> {
+        let mut tools = Self::catalog();
+        if let Some(function) = tools
+            .last_mut()
+            .and_then(|tool| tool.get_mut("function"))
+            .and_then(Value::as_object_mut)
+        {
+            function.insert(
+                "description".into(),
+                Value::String(BACKGROUND_DELEGATE_DESCRIPTION.into()),
+            );
+        }
+        tools
+    }
+
+    /// Whether a frozen catalog selects durable next-turn delegation delivery.
+    #[must_use]
+    pub fn catalog_uses_background_delivery(catalog: &[Value]) -> bool {
+        catalog.iter().any(|tool| {
+            tool.get("function").and_then(|function| function.get("name")).and_then(Value::as_str)
+                == Some(DELEGATE_TOOL)
+                && tool
+                    .get("function")
+                    .and_then(|function| function.get("description"))
+                    .and_then(Value::as_str)
+                    == Some(BACKGROUND_DELEGATE_DESCRIPTION)
+        })
     }
 
     /// Whether an ordered catalog exposes leaf delegation.
@@ -206,6 +252,9 @@ struct DelegateArgs {
 async fn execute_delegate(config: AgentToolsConfig, plan: PlannedToolCall) -> ToolTerminal {
     let result = decode_delegate_args(&plan.arguments).and_then(validate_delegate_args);
     let outcome = match result {
+        Ok(arguments) if config.background_parent.is_some() => {
+            enqueue_child(&config, &plan, arguments).map(|handle| (handle.clone(), handle))
+        }
         Ok(arguments) => run_child(&config, &plan, arguments).await,
         Err(error) => Err(error),
     };
@@ -224,6 +273,69 @@ async fn execute_delegate(config: AgentToolsConfig, plan: PlannedToolCall) -> To
         effect: ToolEffect::ModelInference,
         receipt,
     }
+}
+
+fn enqueue_child(
+    config: &AgentToolsConfig,
+    plan: &PlannedToolCall,
+    arguments: DelegateArgs,
+) -> Result<String, String> {
+    let parent_session_id = config
+        .background_parent
+        .clone()
+        .ok_or_else(|| "background delegation has no parent session".to_owned())?;
+    let identity = stable_delegation_identity(&plan.execution_key);
+    let delegation_id =
+        DelegationId::new(format!("delegation-{identity}")).map_err(|error| error.to_string())?;
+    let completion_event_id = CompletionEventId::new(format!("completion-{identity}"))
+        .map_err(|error| error.to_string())?;
+    let child_session_id =
+        SessionId::new(format!("child-{identity}")).map_err(|error| error.to_string())?;
+    let mut sessions = SqliteSessionStore::open(&config.state)
+        .map_err(|error| format!("could not open parent session: {error}"))?;
+    let parent = sessions
+        .load(&parent_session_id)
+        .map_err(|error| format!("could not load parent session: {error}"))?;
+    let system_prompt = child_system_prompt(&config.root, &arguments);
+    let tools = ReadOnlyLocalTools::catalog();
+    let child_config = SessionConfig {
+        session_id: child_session_id.clone(),
+        lineage_id: LineageId::new(child_session_id.as_str()).map_err(|error| error.to_string())?,
+        prompt_manifest: PromptManifest::new(
+            1,
+            EngineId::new(parent.config.prompt_manifest.engine().as_str())
+                .map_err(|error| error.to_string())?,
+            ManifestDigest::new(digest(system_prompt.as_bytes()))
+                .map_err(|error| error.to_string())?,
+            ManifestDigest::new(digest(
+                &serde_json::to_vec(&tools).map_err(|error| error.to_string())?,
+            ))
+            .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?,
+        transport: parent.config.transport,
+        provider_adapter: parent.config.provider_adapter,
+        base_url: parent.config.base_url,
+        api_key_env: parent.config.api_key_env,
+        model: parent.config.model,
+        tool_root: parent.config.tool_root,
+        system_prompt,
+        tools,
+    };
+    let spec = DelegationSpec {
+        delegation_id: delegation_id.clone(),
+        completion_event_id,
+        parent_session_id,
+        child_session_id,
+        goal: arguments.goal,
+        context: arguments.context,
+    };
+    SqliteDelegationStore::open(&config.state)
+        .and_then(|mut store| store.create_with_child(child_config, spec, unix_time_ms()?))
+        .map_err(|error| format!("could not durably queue delegation: {error}"))?;
+    Ok(format!(
+        "Queued background delegation {delegation_id}. Its result will be delivered with a later explicit user turn."
+    ))
 }
 
 async fn run_child(
@@ -315,6 +427,23 @@ fn bounded(value: String) -> String {
     let mut bounded = value.chars().take(MAX_RESULT_CHARS).collect::<String>();
     bounded.push_str("\n[delegated result truncated]");
     bounded
+}
+
+fn stable_delegation_identity(execution_key: &str) -> String {
+    format!("{:x}", Sha256::digest(execution_key.as_bytes()))
+}
+
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn unix_time_ms() -> Result<u64, ports::DelegationStoreError> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| ports::DelegationStoreError::Invalid(error.to_string()))?
+        .as_millis();
+    u64::try_from(millis)
+        .map_err(|_| ports::DelegationStoreError::Invalid("Unix timestamp exceeds u64".into()))
 }
 
 #[cfg(test)]

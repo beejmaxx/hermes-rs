@@ -127,7 +127,7 @@ async fn run_ephemeral_chat(
     let settings = LiveSettings::for_new(&arguments.runtime)?;
     let scope = live_execution_scope()?;
     let state = state_path(state_override)?;
-    let outcome = execute_turn(&settings, Vec::new(), prompt, &scope, &state).await?;
+    let outcome = execute_turn(&settings, Vec::new(), prompt, &scope, &state, None).await?;
     println!("{}", completed_response(&outcome)?);
     Ok(())
 }
@@ -163,7 +163,9 @@ async fn run_durable_chat(
     let session_id = snapshot.config.session_id.clone();
     let generation = snapshot.owner_generation;
     let previous_len = snapshot.conversation.len();
-    let outcome = execute_turn(&settings, snapshot.conversation, prompt, &scope, &state).await?;
+    let outcome =
+        execute_turn(&settings, snapshot.conversation, prompt, &scope, &state, Some(&session_id))
+            .await?;
     let response = completed_response(&outcome)?.to_owned();
     let appended = outcome.semantic_conversation.get(previous_len..).ok_or_else(|| {
         anyhow::anyhow!("runtime returned a conversation shorter than its durable prefix")
@@ -179,8 +181,9 @@ pub(super) async fn execute_turn(
     prompt: &str,
     scope: &str,
     state: &Path,
+    session_id: Option<&SessionId>,
 ) -> anyhow::Result<ContractOutcome> {
-    execute_turn_inner(settings, semantic_history, prompt, scope, state, None).await
+    execute_turn_inner(settings, semantic_history, prompt, scope, state, session_id, None).await
 }
 
 pub(super) async fn execute_turn_observed(
@@ -189,9 +192,11 @@ pub(super) async fn execute_turn_observed(
     prompt: &str,
     scope: &str,
     state: &Path,
+    session_id: Option<&SessionId>,
     observer: &mut dyn runtime::RuntimeEventObserver,
 ) -> anyhow::Result<ContractOutcome> {
-    execute_turn_inner(settings, semantic_history, prompt, scope, state, Some(observer)).await
+    execute_turn_inner(settings, semantic_history, prompt, scope, state, session_id, Some(observer))
+        .await
 }
 
 async fn execute_turn_inner(
@@ -200,11 +205,12 @@ async fn execute_turn_inner(
     prompt: &str,
     scope: &str,
     state: &Path,
+    session_id: Option<&SessionId>,
     observer: Option<&mut dyn runtime::RuntimeEventObserver>,
 ) -> anyhow::Result<ContractOutcome> {
     let api_key = read_api_key(settings.api_key_env.as_deref())?;
     let mut provider = OpenAiCompatibleProvider::new(&settings.base_url, api_key.clone())?;
-    let tools_config = AgentToolsConfig::new(
+    let mut tools_config = AgentToolsConfig::new(
         settings.root.clone(),
         state.to_path_buf(),
         settings.base_url.clone(),
@@ -212,6 +218,11 @@ async fn execute_turn_inner(
         settings.model.clone(),
         AgentTools::catalog_enables_delegation(&settings.tools),
     )?;
+    if AgentTools::catalog_uses_background_delivery(&settings.tools) {
+        let parent = session_id
+            .context("durable background delegation requires an owning parent session")?;
+        tools_config = tools_config.with_background_parent(parent.clone());
+    }
     let tools = AgentTools::new(tools_config, scope)?;
     let ledger = SqliteEffectLedger::open(state)
         .with_context(|| format!("could not open effect ledger {}", state.display()))?;
@@ -251,6 +262,14 @@ pub(super) fn completed_response(outcome: &ContractOutcome) -> anyhow::Result<&s
 
 impl LiveSettings {
     pub(super) fn for_new(arguments: &RuntimeArgs) -> anyhow::Result<Self> {
+        Self::for_new_with_tools(arguments, AgentTools::catalog())
+    }
+
+    pub(super) fn for_gateway(arguments: &RuntimeArgs) -> anyhow::Result<Self> {
+        Self::for_new_with_tools(arguments, AgentTools::background_catalog())
+    }
+
+    fn for_new_with_tools(arguments: &RuntimeArgs, tools: Vec<Value>) -> anyhow::Result<Self> {
         let provider = arguments.provider.unwrap_or(ProviderPreset::OpenAi);
         let model = arguments
             .model
@@ -284,7 +303,7 @@ impl LiveSettings {
             model: model.into(),
             root,
             system_prompt,
-            tools: AgentTools::catalog(),
+            tools,
         })
     }
 
@@ -316,6 +335,19 @@ impl LiveSettings {
             api_key_env: config.api_key_env.clone(),
             model: config.model.clone(),
             root,
+            system_prompt: config.system_prompt.clone(),
+            tools: config.tools.clone(),
+        })
+    }
+
+    pub(super) fn from_snapshot(snapshot: &SessionSnapshot) -> anyhow::Result<Self> {
+        let config = &snapshot.config;
+        Ok(Self {
+            provider: ProviderPreset::from_adapter(&config.provider_adapter)?,
+            base_url: config.base_url.clone(),
+            api_key_env: config.api_key_env.clone(),
+            model: config.model.clone(),
+            root: PathBuf::from(&config.tool_root),
             system_prompt: config.system_prompt.clone(),
             tools: config.tools.clone(),
         })

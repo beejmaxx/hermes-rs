@@ -100,11 +100,11 @@ history. Gateway startup reconciles a leftover `running` claim to
 `outcome_unknown` and surfaces it on resume without automatic replay. See
 [foreground-turns.md](foreground-turns.md).
 
-The background-delegation substrate has generation-guarded claims, worker
-leases and fencing, `outcome_unknown` reconciliation, and a claimed completion
-outbox. See [durable-delegation.md](durable-delegation.md). A long-lived host
-still needs to connect that state machine to child execution and legal
-new-turn delivery before background delegation is advertised.
+The stdio gateway connects the background-delegation substrate end to end:
+atomic child/spec acceptance, generation-guarded claims, heartbeating leases,
+worker fencing, atomic child-turn/terminal/outbox completion, conservative
+restart reconciliation, and claimed delivery with the next explicit parent
+turn. See [durable-delegation.md](durable-delegation.md).
 
 ## Leaf delegation
 
@@ -120,11 +120,12 @@ The parent receives only a bounded final summary. Multiple delegation calls in
 one provider response are polled concurrently, while the runtime still
 projects their tool results back to the provider in original call order.
 
-This is deliberately synchronous and leaf-only. Background delivery,
-steering, cancellation, reconnect-after-restart, and durable worker leases are
-not inferred from the old Kanban workflow. The persistence contract underneath
-those features is now explicit, but this tool continues to wait for its child
-until the supervisor and delivery host are wired end to end.
+The one-shot `chat` host deliberately keeps this behavior synchronous. New
+gateway sessions freeze a different description of the same tool name: it
+returns a durable handle immediately, and the gateway supervisor delivers the
+child terminal at the next explicit user turn. Both variants remain leaf-only;
+steering, cancellation, and nested orchestration are later transitions rather
+than assumptions copied from the old Kanban workflow.
 
 ## Long-lived client edge
 

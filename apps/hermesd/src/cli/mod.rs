@@ -1,5 +1,6 @@
 //! Command-line application paths.
 
+mod background;
 mod chat;
 mod effect;
 mod gateway;

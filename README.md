@@ -96,14 +96,14 @@ effect ledger before dispatch and records its terminal result afterward.
 `effect pending` exposes records left between those writes by an interrupted
 process; it does not retry them automatically.
 
-New sessions can use `delegate_task` for focused independent work. Each child
-gets a fresh context, the same provider/model and workspace root, only the
-read-only tools, a 32-attempt budget, and no ability to delegate recursively.
-Multiple delegation calls from one model response run concurrently. Only each
-child's final bounded summary returns to the parent; its intermediate messages
-and tool calls remain isolated, while its effects use a distinct durable
-journal scope. Existing sessions keep their frozen older tool catalog rather
-than gaining this capability mid-lineage.
+New sessions can use `delegate_task` for focused independent work. In
+`hermesd chat`, children remain synchronous and return their bounded summaries
+to the current turn. In `hermesd gateway`, the frozen tool contract instead
+queues a durable child immediately. A fenced, heartbeating worker runs that
+child in its own immutable session, and its terminal result enters the parent
+exactly once with the next explicit user turn. Both modes give children only
+the read-only tools and no recursive delegation. Existing sessions retain the
+tool behavior frozen in their original catalog.
 
 The same durable runtime is now also reachable through a minimal long-lived
 stdio JSON-RPC host compatible with the core Hermes TUI framing:
@@ -114,14 +114,14 @@ cargo run -p hermesd -- gateway \
 ```
 
 This command emits protocol frames for a client rather than drawing a UI. It
-supports the create → prompt → live event stream → atomic commit → durable
-resume path. Accepted prompts are claimed before provider work; a gateway
-restart exposes abandoned work as `outcome_unknown` without replaying it. The
-stock Hermes launcher does not select the Rust child yet, while the companion
+supports foreground streaming and recovery plus durable background delegation.
+Accepted prompts and delivered background events are captured atomically
+before provider work. A gateway restart exposes abandoned foreground or child
+work as `outcome_unknown` without replaying billable inference. The stock
+Hermes launcher does not select the Rust child yet, while the companion
 `beejmaxx/hermes-agent` fork can run it explicitly. See
 [docs/tui-gateway.md](docs/tui-gateway.md) for the exact supported method set
 launch command and current limitations.
 
-The bounded contracts, live durable path, delegated child turns, and gateway
-host all use the same runtime. Connecting durable background supervision and
-legal completion delivery is the next coordination milestone.
+The bounded contracts, foreground turns, synchronous children, and durable
+gateway workers all use the same runtime.

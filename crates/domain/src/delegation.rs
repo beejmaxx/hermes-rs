@@ -3,7 +3,19 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{CompletionEventId, DelegationId, DelegationWorkerId, FencingToken, SessionId};
+use crate::{
+    CompletionEventId, DelegationId, DelegationWorkerId, FencingToken, OwnerGeneration, SessionId,
+};
+
+/// Generation and fencing proof held by one active delegation worker.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationAuthority {
+    /// Current authoritative lifecycle generation.
+    pub owner_generation: OwnerGeneration,
+    /// Token fencing every earlier worker owner.
+    pub fencing_token: FencingToken,
+}
 
 /// Immutable relationship and task input captured before background dispatch.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
