@@ -23,7 +23,7 @@ Rust is expected to own the invariant-heavy narrow waist:
 - task leases, fencing, inbox/outbox delivery, and recovery;
 - backend protocol validation and process supervision.
 
-TypeScript clients remain TypeScript. Python remains a valid supervised edge
+Existing TypeScript clients remain TypeScript. Python remains a valid supervised edge
 for niche providers, platform adapters, media/ML integrations, and plugins that
 cannot mutate authoritative state directly.
 
@@ -120,6 +120,29 @@ effect ledger before dispatch and records its terminal result afterward.
 `effect pending` exposes records left between those writes by an interrupted
 process; it does not retry them automatically.
 
+## Native terminal client
+
+`hermesd tui` is the minimal engine-neutral reference client. It starts the
+same stdio gateway as a supervised child with literal arguments, then renders
+only gateway sessions, canonical messages, streaming text, tool activity,
+approvals, and lifecycle state:
+
+```bash
+cargo run -p hermesd -- tui \
+  --engine codex \
+  --codex-command /absolute/path/to/codex \
+  --model gpt-5.6-sol \
+  --reasoning low \
+  --root .
+```
+
+The Codex process inherits the existing authenticated login; Hermes does not
+copy its credential. Press `n` to create a session, `Enter` to resume or send,
+`Esc` to interrupt a running turn, and `F2` to return to the session picker.
+Terminal effects show an allow-once/deny prompt. On completion or interruption,
+the client discards its temporary stream and reloads the gateway's canonical
+session projection. Restarting the TUI therefore does not depend on UI state.
+
 New sessions can use `delegate_task` for focused independent work. In
 `hermesd chat`, children remain synchronous and return their bounded summaries
 to the current turn. In `hermesd gateway`, the frozen tool contract instead
@@ -151,8 +174,9 @@ remains optional local work. See
 launch command, and current limitations.
 
 New gateway sessions additionally expose a real shell-backed `terminal` tool.
-Every call blocks on the Ink approval overlay; the plan is journaled before the
-prompt, and `once` or `deny` is persisted before dispatch or rejection. The
+Every call blocks on the connected client's approval overlay; the plan is
+journaled before the prompt, and `once` or `deny` is persisted before dispatch
+or rejection. The
 working directory is the frozen root, but an approved command is not filesystem
 sandboxed. See [docs/terminal-approvals.md](docs/terminal-approvals.md).
 

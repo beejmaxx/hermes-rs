@@ -16,6 +16,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 async-stream.workspace = true
 clap.workspace = true
+crossterm.workspace = true
 dirs.workspace = true
 domain = { path = "../../crates/domain" }
 eventsource-stream.workspace = true
@@ -25,6 +26,7 @@ ignore.workspace = true
 ports = { path = "../../crates/ports" }
 protocol = { path = "../../crates/protocol" }
 regex.workspace = true
+ratatui.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 runtime = { path = "../../crates/runtime" }
@@ -40,6 +42,7 @@ workspace = true
 
 [dev-dependencies]
 futures-executor.workspace = true
+portable-pty.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["time"] }
 wiremock.workspace = true

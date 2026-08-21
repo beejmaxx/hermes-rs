@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use hermesd::{
-    cli::{ChatArgs, GatewayArgs, list_pending_effects, list_sessions, run_chat, run_gateway},
+    cli::{
+        ChatArgs, GatewayArgs, TuiArgs, list_pending_effects, list_sessions, run_chat, run_gateway,
+        run_tui,
+    },
     contracts::{ContractCorpus, scripted_agent_turn},
 };
 use protocol::ContractKind;
@@ -26,6 +29,8 @@ enum Command {
     Chat(ChatArgs),
     /// Serve the minimal Hermes JSON-RPC gateway over newline-delimited stdio.
     Gateway(GatewayArgs),
+    /// Run the minimal native Rust terminal client over the gateway protocol.
+    Tui(TuiArgs),
     /// Inspect durable sessions.
     Session {
         #[command(subcommand)]
@@ -75,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Chat(arguments) => run_chat(arguments, cli.state.as_deref()).await,
         Command::Gateway(arguments) => run_gateway(arguments, cli.state.as_deref()).await,
+        Command::Tui(arguments) => run_tui(arguments, cli.state.as_deref()).await,
         Command::Session { command: SessionCommand::List } => list_sessions(cli.state.as_deref()),
         Command::Effect { command: EffectCommand::Pending } => {
             list_pending_effects(cli.state.as_deref())

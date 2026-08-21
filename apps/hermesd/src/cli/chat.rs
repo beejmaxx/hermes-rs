@@ -1,6 +1,7 @@
 //! Live stateless and durable chat command paths.
 
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     time::SystemTime,
 };
@@ -55,6 +56,26 @@ pub(super) struct RuntimeArgs {
     /// Frozen Codex reasoning effort. Defaults to low for a new Codex session.
     #[arg(long, value_enum)]
     reasoning: Option<ReasoningEffortPreset>,
+}
+
+impl RuntimeArgs {
+    pub(super) fn gateway_argv(&self) -> Vec<OsString> {
+        let mut arguments = Vec::new();
+        push_value(&mut arguments, "--engine", self.engine.map(EnginePreset::as_str));
+        push_value(&mut arguments, "--provider", self.provider.map(ProviderPreset::as_str));
+        push_value(&mut arguments, "--model", self.model.as_deref());
+        push_value(&mut arguments, "--base-url", self.base_url.as_deref());
+        push_value(&mut arguments, "--api-key-env", self.api_key_env.as_deref());
+        push_path(&mut arguments, "--root", self.root.as_deref());
+        push_value(&mut arguments, "--system", self.system.as_deref());
+        push_path(&mut arguments, "--codex-command", self.codex_command.as_deref());
+        push_value(
+            &mut arguments,
+            "--reasoning",
+            self.reasoning.map(ReasoningEffortPreset::as_str),
+        );
+        arguments
+    }
 }
 
 /// Arguments for one live chat turn.
@@ -114,6 +135,21 @@ impl From<ReasoningEffortPreset> for ModelReasoningEffort {
             ReasoningEffortPreset::Xhigh => Self::Xhigh,
             ReasoningEffortPreset::Max => Self::Max,
             ReasoningEffortPreset::Ultra => Self::Ultra,
+        }
+    }
+}
+
+impl ReasoningEffortPreset {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 }
@@ -598,7 +634,7 @@ impl LiveSettings {
         let _validated_tools = ReadOnlyLocalTools::new(&root, "session-config-validation")?;
         let system_prompt = arguments.system.clone().unwrap_or_else(|| {
             let terminal = if AgentTools::catalog_enables_terminal(&tools) {
-                " You may propose one terminal command at a time; it runs only after the user explicitly approves it."
+                " The worker sandbox is read-only, but the Hermes-hosted terminal dynamic tool may run one command at a time after the user explicitly approves it. Use that tool when the user asks you to run a command; do not mistake the worker sandbox for a prohibition on proposing the hosted tool."
             } else {
                 " Never claim to have modified files or run commands."
             };
@@ -914,4 +950,57 @@ fn live_execution_scope() -> anyhow::Result<String> {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn push_value(arguments: &mut Vec<OsString>, flag: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        arguments.push(flag.into());
+        arguments.push(value.into());
+    }
+}
+
+fn push_path(arguments: &mut Vec<OsString>, flag: &str, value: Option<&Path>) {
+    if let Some(value) = value {
+        arguments.push(flag.into());
+        arguments.push(value.as_os_str().to_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::OsString, path::PathBuf};
+
+    use super::{EnginePreset, ReasoningEffortPreset, RuntimeArgs};
+
+    #[test]
+    fn gateway_argv_preserves_literal_runtime_values() {
+        let arguments = RuntimeArgs {
+            engine: Some(EnginePreset::Codex),
+            provider: None,
+            model: Some("gpt-test".into()),
+            base_url: None,
+            api_key_env: None,
+            root: Some(PathBuf::from("workspace with spaces")),
+            system: Some("literal;$(not-a-command)".into()),
+            codex_command: Some(PathBuf::from("codex with spaces")),
+            reasoning: Some(ReasoningEffortPreset::High),
+        };
+        assert_eq!(
+            arguments.gateway_argv(),
+            vec![
+                OsString::from("--engine"),
+                OsString::from("codex"),
+                OsString::from("--model"),
+                OsString::from("gpt-test"),
+                OsString::from("--root"),
+                OsString::from("workspace with spaces"),
+                OsString::from("--system"),
+                OsString::from("literal;$(not-a-command)"),
+                OsString::from("--codex-command"),
+                OsString::from("codex with spaces"),
+                OsString::from("--reasoning"),
+                OsString::from("high"),
+            ]
+        );
+    }
 }

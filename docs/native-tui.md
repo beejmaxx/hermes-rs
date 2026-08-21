@@ -1,6 +1,6 @@
 # Native TUI milestone
 
-This document bounds the first native Rust client. It records UX patterns from
+This document defines the first native Rust client. It records UX patterns from
 the Codex TUI, T3 Code, and the Hermes Ink TUI, then maps those behaviors to the
 existing `hermesd gateway` protocol.
 
@@ -53,7 +53,7 @@ Those surfaces require demonstrated user needs.
 | Show tool activity | `tool.start`, `tool.complete` | Render compact inline rows |
 | Request approval | `approval.request` | Render an approval overlay |
 | Resolve approval | `approval.respond` | First client supports allow-once and deny |
-| Interrupt a turn | `session.interrupt` | Harden Codex lifecycle before TUI work |
+| Interrupt a turn | `session.interrupt` | Use cooperative Codex interruption |
 | Reflect lifecycle | `session.info` | Drive busy/interrupted/status projection |
 | Recover after restart | `session.resume` recovery and inflight fields | Kernel remains authoritative |
 
@@ -82,3 +82,12 @@ implemented correctly from these surfaces.
 The client may cache drafts, scroll position, and temporary streaming text.
 Everything durable must be reloadable from a fresh gateway process and
 `session.resume`.
+
+## Implemented proof
+
+`hermesd tui` launches `hermesd gateway` as an exact-argv child and consumes
+only the protocol above. Its reducer and renderer have behavior tests. A
+PTY-level process test creates a session, submits a turn, renders a terminal
+approval, denies it, verifies the command did not run, reloads the committed
+transcript, exits, starts an entirely new TUI and gateway process, and resumes
+the same kernel-owned history.
